@@ -55,13 +55,13 @@ dump 的初衷是"留证据"，但**把刚判为污染的内容原样再抄一�
 
 ```bash
 # 看有哪些可提升的样本
-bash /mnt/models/dsh-workspace/tools/dsh-local-loop-fuse/promote-sample.sh
+bash ../promote-sample.sh
 
 # 把最新一条提升为 loop-detect 回归夹具（写 ../loop-detect-fixtures/，并打印 README 该加的那一行）
-bash /mnt/models/dsh-workspace/tools/dsh-local-loop-fuse/promote-sample.sh --latest
+bash ../promote-sample.sh --latest
 
 # 只看会写什么
-bash /mnt/models/dsh-workspace/tools/dsh-local-loop-fuse/promote-sample.sh --dry-run --latest
+bash ../promote-sample.sh --dry-run --latest
 ```
 
 ⚠️ **提升后必须人工确认「期望值」再填 README 表**：自动 dump 只保证「loop-fuse 当时判它是循环」，

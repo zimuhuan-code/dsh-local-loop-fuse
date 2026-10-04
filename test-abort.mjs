@@ -10,6 +10,7 @@
  *
  * 用法：node test-abort.mjs     （约 1 秒，不依赖 dsh，不起网络）
  */
+import { tmpdir } from 'node:os';
 import { apply, DEFAULTS, turnOfAttempt } from './index.js';
 
 const results = [];
@@ -38,7 +39,8 @@ function mkAgent(sid, opts = {}) {
   return agent;
 }
 
-const LOG = '/mnt/models/dsh-workspace/.tmp/loop-fuse-test.log';
+// v0.7.6：测试日志落**临时目录**，不再写死作者本机的绝对路径（公开包不该假设本机目录存在）
+const LOG = `${tmpdir()}/loop-fuse-test.log`;
 
 function mk(cfgOverride = {}) {
   const ctx = mkCtx();

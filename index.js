@@ -20,6 +20,12 @@
  *     ② **限长**（`dumpMaxChars`，只留判据窗口及附近，不dump整段输出）；
  *     ③ **禁检索名单内不落盘**（`dumpDenylistPath`：机主明确标记过的会话一律跳过）。
  *   另加 `dumpKeep` 条数上限（防病态循环写爆盘）与 (session,turn,kind) 去重（防同一 turn 反复写）。
+ * v0.7.6（2026-10-04）：**去掉写死的本机绝对路径**（公开发布后自查发现的问题）——
+ *   ① 默认落点全部改为**按本实例 `DSH_HOME` 派生**（`${DSH_HOME}/logs/dsh-local-loop-fuse/…`），
+ *      本机（原路径）由 `profiles/web/cordis.patch.yml` 用 `config:` 显式钉住 ⇒ 行为不变；
+ *   ② `appendLine` 补 `mkdirSync` —— 旧默认值指的本机目录恰好已存在，**换个环境就静默不写日志**；
+ *   ③ `loaded` 行的版本号改为**动态读 `package.json`**（此前硬编码 `v0.7.1`，bump 后从不更新，
+ *      曾导致"怎么升级日志都写 0.7.1"的误判）。
  *
  * ── v0.4.0 为什么推倒重来（2026-10-01 实录，详见知识库
  *    `05-issues/open/loop-fuse-kills-long-tasks.md`）────────────────────
@@ -50,9 +56,31 @@
  *   2. 工具**永久挂死**时：靠 `stallMinutesWithTool`（默认 45 min）兜底。
  *   3. ②线判据只认「零事件」。若某个工具每 9 分钟返回一次垃圾结果，判据不会命中。
  *
- * 安装：`dsh plugin --profile web add link:/mnt/models/dsh-workspace/tools/dsh-local-loop-fuse`
+ * 安装：`dsh plugin --profile <profile> add link:/path/to/dsh-local-loop-fuse`
+ *   （或 `npm i dsh-local-loop-fuse`）。
  * 改代码后必须重启 dsh（`link:` + ESM 缓存，hot-applied ≠ 换掉代码）。
+ * ⚠️ 默认落点 = **`${DSH_HOME}/logs/dsh-local-loop-fuse/`**（可移植）；要换位置就在该 profile 的
+ *   `cordis.patch.yml` 里加一条 `- id: dsh-local-loop-fuse` + `config: { logPath, cancelLogPath, dumpDir }`。
  */
+
+import { dirname } from 'node:path';
+import { mkdirSync, readFileSync } from 'node:fs';
+
+/** 版本号：**动态读同目录 `package.json`**（v0.7.6 修 —— 此前硬编码 `v0.7.1`，
+ *  bump 之后日志永远打旧版本，2026-10-03 曾因此误判"升级没生效"）。 */
+const VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+  } catch {
+    return 'unknown';
+  }
+})();
+
+/** 本实例的 DSH home（1.5 / 2.0 各自不同 —— 所以只能**运行时解析**，不能写死）。 */
+const DSH_HOME_DIR = process.env.DSH_HOME ?? `${process.env.HOME ?? '.'}/.dsh`;
+/** 本插件的默认落点根目录（v0.7.6：**可移植**，跟着 `DSH_HOME` 走）。
+ *  ⚠️ 本机要沿用旧路径（`.tmp/loop-fuse*.log` 与 `samples/`）由 `cordis.patch.yml` 显式钉住。 */
+const LOOP_FUSE_DIR = `${DSH_HOME_DIR}/logs/dsh-local-loop-fuse`;
 
 export const name = 'dsh-local-loop-fuse';
 export const inject = [];
@@ -108,8 +136,8 @@ export const DEFAULTS = {
   strikesBeforeCancel: 2, // 同一会话**窗口内** strike 达此数 ⇒ agent.cancel() 中止当前 turn
   strikeWindowMinutes: 120, // strike 时效窗口：超过此时长的旧 strike 不计入（=「近期反复」语义）
   cancelOnStrikes: true,  // false = 只记 CANCEL-DRY，不真切断（试阈值时用）
-  logPath: '/mnt/models/dsh-workspace/.tmp/loop-fuse.log',
-  cancelLogPath: '/mnt/models/dsh-workspace/.tmp/loop-fuse-cancels.log',
+  logPath: `${LOOP_FUSE_DIR}/loop-fuse.log`,
+  cancelLogPath: `${LOOP_FUSE_DIR}/loop-fuse-cancels.log`,
   // ── ④ 触发即 dump 样本（v0.6.0 新增）────────────────────────────
   // 目的：把"判中的那一刻"存成**可离线复跑的样本**。三条线都 dump（包括**只记 strike、没掐断**的
   //   弱命中 —— 那些正是**误杀候选**，对调参比真循环更值钱）。
@@ -120,15 +148,14 @@ export const DEFAULTS = {
   // 落点放在插件自己的 `samples/`（**在工作区 tools/ 下 ⇒ 进每日备份**；不放 `.tmp/`，
   //   因为 `.tmp/` 被备份排除、样本是证据不该丢）。
   dumpSamples: true,          // 总开关（false = 完全不落盘）
-  dumpDir: '/mnt/models/dsh-workspace/tools/dsh-local-loop-fuse/samples',
+  dumpDir: `${LOOP_FUSE_DIR}/samples`,
   dumpMaxChars: 8000,         // 单条样本正文上限（字符）
   dumpKeep: 30,               // 目录内最多保留多少条（超出按时间删最旧）
   dumpRedact: true,           // 脱敏（⚠️ 除非明确知道自己在干什么，否则不要关）
   // ⚠️ 必须按**本实例的 home** 解析，不能硬编码：1.5 与 2.0 各有独立 home，
   //    硬编码会让 2.0 去读 1.5 的名单（2026-10-03 实测：2.0 加载行打印的是 1.5 的路径）。
   //    当前 2.0 尚无名单文件 ⇒ 影响为 0，但语义错：在 2.0 上屏蔽的会话不会被 dump 跳过。
-  dumpDenylistPath: `${process.env.DSH_HOME ?? '/mnt/models/dsh-home'}`
-    + '/storages/recall-denylist.json',
+  dumpDenylistPath: `${DSH_HOME_DIR}/storages/recall-denylist.json`,
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -314,7 +341,13 @@ export const apply = (ctx, config) => {
     try {
       // eslint-disable-next-line
       import('node:fs').then((fs) => {
-        try { fs.appendFileSync(path, `${stamp()} ${line}\n`); } catch { /* ignore */ }
+        try {
+          // v0.7.6：默认落点改为按 `DSH_HOME` 派生后，**目录不再保证预先存在**
+          //   （旧版写死的本机目录恰好已在）⇒ 不 mkdir 的话，新环境会**静默不写日志**。
+          //   失败仍一律吞掉：落盘是尽力而为，不该影响会话。
+          mkdirSync(dirname(path), { recursive: true });
+          fs.appendFileSync(path, `${stamp()} ${line}\n`);
+        } catch { /* ignore */ }
       }).catch(() => {});
     } catch { /* ignore */ }
   };
@@ -753,7 +786,7 @@ export const apply = (ctx, config) => {
   // 不让这个定时器拖住进程退出
   if (typeof timer?.unref === 'function') timer.unref();
 
-  note(`loaded v0.7.1 enabled=${cfg.enabled} dryRun=${cfg.dryRun} minChars=${cfg.minChars} `
+  note(`loaded v${VERSION} enabled=${cfg.enabled} dryRun=${cfg.dryRun} minChars=${cfg.minChars} `
      + `window=${cfg.window} repeats=${cfg.repeats} history=${cfg.history} `
      + `signalMaxAgeMinutes=${cfg.signalMaxAgeMinutes} `
      + `abortViaCancel=${cfg.abortViaCancel} cancelKeepInbox=${cfg.cancelKeepInbox} `
@@ -762,7 +795,7 @@ export const apply = (ctx, config) => {
      + `repeatCallLimit=${cfg.repeatCallLimit} repeatCallCancel=${cfg.repeatCallCancel} `
      + `strikesBeforeCancel=${cfg.strikesBeforeCancel} strikeWindowMinutes=${cfg.strikeWindowMinutes} `
      + `cancelOnStrikes=${cfg.cancelOnStrikes}`);
-  note(`loaded v0.7.1 dumpSamples=${cfg.dumpSamples} dumpDir=${cfg.dumpDir} `
+  note(`loaded v${VERSION} dumpSamples=${cfg.dumpSamples} dumpDir=${cfg.dumpDir} `
      + `dumpMaxChars=${cfg.dumpMaxChars} dumpKeep=${cfg.dumpKeep} dumpRedact=${cfg.dumpRedact} `
      + `dumpDenylistPath=${cfg.dumpDenylistPath}`);
 };

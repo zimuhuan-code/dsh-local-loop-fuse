@@ -57,7 +57,7 @@ console.log('── A. redactSecrets ──');
     check(`A.${label} 被脱敏`, ok(out), `→ ${out.slice(0, 62)}`);
   }
   // 关键反例：**不能**把普通内容一起毁掉（过度脱敏会让样本失去价值）
-  const keep = '帮我看看 /mnt/models/dsh-workspace/tools/dsh-local-loop-fuse/index.js 第 123 行，'
+  const keep = '帮我看看 /opt/somewhere/dsh-local-loop-fuse/index.js 第 123 行，'
     + '窗口 window=600、repeats=3，这段中文和路径必须原样保留。';
   check('A.负例 普通路径/中文/数字**不被**误脱敏', redactSecrets(keep) === keep);
   check('A.负例 32 位 md5（非 64）不被误脱敏',

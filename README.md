@@ -17,7 +17,15 @@ DSH 原生插件：**输出 / 思考循环护栏**。三条线：
 ③ 同一会话窗口内**强信号**累计达 `strikesBeforeCancel` ⇒ 真切断。
 **① 线已上膛（`dryRun=false`，2026-09-29 维护者定）**。
 
-- 版本：**v0.7.5**（2026-10-03：**修 `cancelWithHook()` 的去重键 `sid` → `sid#turn`** —— 原先一旦某会话被掐断过一次，
+- 版本：**v0.7.6**（2026-10-04：**去掉写死的本机绝对路径** —— 公开发布后自查发现，原默认落点全是
+  作者本机路径（`<workspace>/.tmp/…`、`<插件目录>/samples`），**别人装上后写日志与 dump 全部静默失效**
+  （两者都在 `try{}catch{}` 里 ⇒ 不报错、不崩 —— 最坏的失败形态：以为在跑，其实什么都没记）。
+  现默认改为**按本实例 `DSH_HOME` 派生**：`${DSH_HOME}/logs/dsh-local-loop-fuse/`；
+  并给 `appendLine` 补了 `mkdirSync`（旧默认值指的本机目录恰好已存在，换个环境就不会写日志）；
+  另把 `loaded` 行的版本号改为**动态读 `package.json`**（此前硬编码 `v0.7.1`，bump 后从不更新 ——
+  2026-10-03 曾因此误判"升级没生效"）。本机行为**不变**：旧路径由 `profiles/web/cordis.patch.yml`
+  的 `config:` 显式钉住。测试 19/12/14/42 全绿）
+- 上一版 **v0.7.5**（2026-10-03：**修 `cancelWithHook()` 的去重键 `sid` → `sid#turn`** —— 原先一旦某会话被掐断过一次，
   它**后续所有 turn 永久不再被掐**（实测：turn 3 掐断后，turn 4 同参连击 6→23 次只报警不动作）；
   现改为"同一 turn 不重复切、**新 turn 仍可再切**"，并在 `turn/end` 清理条目；`test-cancel` 13 → 14 用例全绿。
   v0.7.2 补「兼容性」一节 + `engines.node`；v0.7.1 起包名与日志名统一为 `loop-fuse`、四线齐备；
@@ -116,7 +124,19 @@ grep -n "loop-fuse" <DSH_HOME>/profiles/web/package.json
 
 ## 配置项
 
-配置通过插件 config 传入，与 `DEFAULTS` 合并（index.js 顶部）：
+配置通过插件 config 传入，与 `DEFAULTS` 合并（index.js 顶部）。
+**在哪写**：该 profile 的 `cordis.patch.yml` 里加一条（`--dump-config` 可核对是否生效）：
+
+```yaml
+- id: dsh-local-loop-fuse
+  config:
+    logPath: /path/to/loop-fuse.log
+    dumpDir: /path/to/samples
+```
+
+⚠️ **落点默认值是可移植的**（v0.7.6 起）：`logPath` / `cancelLogPath` / `dumpDir` 一律派生自
+`${DSH_HOME}`（默认 `~/.dsh`）⇒ 装到哪台机器就写哪台机器的 `$DSH_HOME/logs/dsh-local-loop-fuse/`，
+**不需要额外配置**；要改位置再用上面那段覆盖。
 
 | 键 | 默认 | 含义 |
 |---|---|---|
@@ -143,13 +163,13 @@ grep -n "loop-fuse" <DSH_HOME>/profiles/web/package.json
 | `strikeWindowMinutes` | `120` | strike 时效窗口 —— 超过此时长的旧 strike **不计入**（v0.3.1 新增） |
 | `cancelOnStrikes` | `true` | `false` = 只记 `CANCEL-DRY` 不真切断（试阈值时用）（v0.3 新增） |
 | `dumpSamples` | `true` | **④线（v0.6.0）**：判中即把证据落一条样本到 `dumpDir`（含**弱命中**，那是误杀候选）；`false` = 一个文件都不写 |
-| `dumpDir` | `<插件目录>/samples` | 样本落点（在 `tools/` 下 ⇒ **进每日备份**） |
+| `dumpDir` | `${DSH_HOME}/logs/dsh-local-loop-fuse/samples` | 样本落点（v0.7.6 起可移植；作者本机仍指 `<插件目录>/samples`，由 `cordis.patch.yml` 钉住） |
 | `dumpMaxChars` | `8000` | 单条样本正文上限（**保尾部** —— 判据窗口在尾部） |
 | `dumpKeep` | `30` | 目录内最多保留条数（超了按 mtime 删最旧，防病态循环写爆盘） |
 | `dumpRedact` | `true` | 脱敏（api key / Bearer / JWT / `password=` / `token=` / 64 位 hex）⚠️ 除非明确知道在干什么，不要关 |
-| `dumpDenylistPath` | `$DSH_HOME/storages/recall-denylist.json` | 会话**在禁检索名单内 ⇒ 不落盘**（日志记 `DUMP-SKIP`）；避免"把判为污染的内容又抄一份" |
-| `logPath` | `<workspace>/.tmp/loop-fuse.log` | 日志落点 |
-| `cancelLogPath` | `<workspace>/.tmp/loop-fuse-cancels.log` | **切断专账**（v0.4.0 新增）：只记"切了谁、为什么、keepInbox 是什么"，方便事后一眼核对 |
+| `dumpDenylistPath` | `${DSH_HOME}/storages/recall-denylist.json` | 会话**在禁检索名单内 ⇒ 不落盘**（日志记 `DUMP-SKIP`）；避免"把判为污染的内容又抄一份" |
+| `logPath` | `${DSH_HOME}/logs/dsh-local-loop-fuse/loop-fuse.log` | 日志落点（v0.7.6 起可移植；目录会自动创建） |
+| `cancelLogPath` | `${DSH_HOME}/logs/dsh-local-loop-fuse/loop-fuse-cancels.log` | **切断专账**（v0.4.0 新增）：只记"切了谁、为什么、keepInbox 是什么"，方便事后一眼核对 |
 
 ### 判定逻辑（`isLooping`）
 
@@ -342,12 +362,14 @@ recall_read(sessionId='gateway-xxx-gw', tail=100)
 ## 日志
 
 ```bash
-tail -20 <workspace>/.tmp/loop-fuse.log
-hotlog <workspace>/.tmp/loop-fuse.log 30
+# v0.7.6 起的默认落点（可移植：跟着本实例的 DSH_HOME 走）
+tail -20 "$DSH_HOME/logs/dsh-local-loop-fuse/loop-fuse.log"
 ```
 
 - 本插件写的是**本地时间**（带 `+08:00` 偏移，见 `stamp()`），故 **`hotlog` 对它不是必需的**
   （`hotlog` 是给 dsh-hot-installer **UTC** 日志用的）。
+- ⚠️ 作者本机钉住了旧路径（`<workspace>/.tmp/loop-fuse.log`，见该机 `cordis.patch.yml`）——
+  读日志前先看一眼 `loaded` 行里的 `logPath` / `dumpDir`，别照抄别人的路径。
 - 加载行：`loaded enabled=… dryRun=… minChars=… window=… repeats=… history=… signalMaxAgeMinutes=… abortViaCancel=… cancelKeepInbox=… maxTurnMinutes=… …`
 - 命中行（**v0.3.3 起节流**：同一 attempt 只在 `hits`=1/6/11… 记录）：
   `DETECT attempt=… turn=… len=… kind=… hits=… hasSignal=… stale=… canCancel=… dryRun=…`
