@@ -1,0 +1,5 @@
+# dsh-local-loop-fuse bundle patch：作为 profile bundle 安装时插入插件行。
+# 行里的 name 就是包名 —— loader 从本 bundle 自己的安装位置解析它。
+- insert:
+    - id: dsh-local-loop-fuse
+      name: 'dsh-local-loop-fuse'

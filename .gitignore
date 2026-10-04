@@ -1,0 +1,7 @@
+# 本机运行产物（真实循环样本含会话 id，不随源码发布）
+samples/*.json
+*.log
+*.bak
+*.bak-*
+node_modules/
+.DS_Store
