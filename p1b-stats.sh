@@ -75,7 +75,17 @@ line '有效（k24 降 & 注入后不再循环）' "$v_ok" "$v_tot"
 line '无效（注入后仍循环）' "$v_no" "$v_tot"
 line '不确定' "$v_un" "$v_tot"
 printf '   %-30s %s\n' '观察中断（turn 结束未满 N）' "$v_cut"
-printf '   %-30s %s\n' '撞每会话上限（INJECT-QUOTA）' "$(c 'P1B-INJECT-QUOTA')"
+printf '   %-30s %s\n' '带进下一个 turn 观察（DEFER）' "$(c 'P1B-OBSERVE-DEFER')"
+printf '   %-30s %s\n' '注入未确认（窗口在、steer 未 resolve）' "$(c 'P1B-OBSERVE.*verdict=注入未确认')"
+printf '   %-30s %s\n' '观测自身出错（OBSERVE-FAIL）' "$(c 'P1B-OBSERVE-FAIL')"
+# §1-7：`blindChars` = 注入所在 attempt 内、steer 尚不可能影响的那段字符数
+#   ⇒ 它是**干预延迟**唯一可用的健康指标，也是**下界**（从"决定注入"到"窗口存在"之间的字符没算）。
+bl=$(grep -ao 'blindChars=[0-9]*' "$LOG" 2>/dev/null | cut -d= -f2 | sort -n)
+if [ -n "$bl" ]; then
+  n=$(echo "$bl" | wc -l); med=$(echo "$bl" | awk -v n="$n" 'NR==int((n+1)/2){print; exit}')
+  printf '   %-30s %s\n' 'blindChars 中位 / 最大' "$med / $(echo "$bl" | tail -1)   （n=$n · 下界）"
+fi
+printf '   %-30s %s\n' '撞 episode 上限（INJECT-QUOTA）' "$(c 'P1B-INJECT-QUOTA')"
 echo "   📌 对照基线：本簇真循环的**基础自愈率 = 2/6 ≈ 33%**（307/308 自愈 · 309/311/313 被按停）"
 echo "      ⇒ 注入有效率**必须与它比**；单次有效不作证据。"
 echo "   📌 「观察中断」是**必须看**的一栏：它高 ⇒ 说明观测窗口（p1bObserveChars，默认 2000）"

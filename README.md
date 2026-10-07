@@ -167,6 +167,7 @@ grep -n "loop-fuse" <DSH_HOME>/profiles/web/package.json
 | `p1bObserveChars` | `2000` | **预注册 N**：注入后再观察多少字符才出观测结论 |
 | `p1bSuccessDropPct` | `50` | **预注册成功阈值**：`k24` 降到 ≤ 注入前的 50% **且** ① 线不再命中 ⇒ 判"有效" |
 | `p1bSteerMaxPerSession` | `2` | **每会话注入上限**（🔴 安全属性，别删）：`attempt` = 一个 step ⇒ 光靠 attempt 内的去重挡不住跨 step 循环（实测一会话 6 条，且每条**永久进会话存档**）|
+| `p1bEpisodeWindowMinutes` | `10` | **注入额度的计数窗口**：距上次注入超过它 ⇒ 视为新的「循环 episode」，额度归零。⚠️ 额度单位必须是 **episode** —— 会话终身制会让样本天花板 = `p1bSteerMaxPerSession`（2），**低于统计脚本自己要求的 n≥5** |
 | `p1bHint` | （见 `DEFAULTS`）| 注入的提示文本（⚠️ 会作为**用户消息**进入会话，等同替使用者发话）|
 | `checkEvery` | `200` | 每新增这么多字符检查一次 |
 | `abortViaCancel` | `true` | **① 线真掐断的主路径**：调 `agent.cancel({kind:'hook',reason})`（v0.3.3 新增，见下节「为什么不能 `signal.abort()`」）|
@@ -452,7 +453,7 @@ node test-abort.mjs        # 12/12 · 集成：① 线"检测 ⇒ 真 cancel"（
 node test-cancel.mjs       # 14/14 · 集成：③ 线 strike ⇒ cancel（约 35 s）
 node test-dump.mjs         # 42/42 · v0.6.0 ④线：脱敏 / 取证切片 / 三条线落盘 / 去重 / 禁名单守卫 / 上限（约 8 s）
 node test-empty-turn.mjs   # 19/19 · v0.8.0 ⑤线：零正文判据 + 上膛路径（约 1 s）
-node test-p1b.mjs          # 20/20 · v0.8.2 ①c：注入 / 跨 attempt 观测 / 每会话上限 / 能力自检 / 消息 invariant（约 3 s）
+node test-p1b.mjs          # 25/25 · v0.8.2 ①c：注入 / 跨 attempt 观测 / DEFER / episode 上限 / FAIL 占额度 / 默认值钉住（约 4 s）
 ```
 
 ⚠️ **写集成测试时务必 `dumpSamples: false`**（或把 `dumpDir` 指到临时目录）——
@@ -479,8 +480,8 @@ node test-p1b.mjs          # 20/20 · v0.8.2 ①c：注入 / 跨 attempt 观测 
 ## 状态与后续
 
 - **v0.8.2（2026-10-07 · 待发布）**：①b 末窗支 + ①b-2 滑窗支（尾部补偿）+ ①c P1-b 注入与观测 +
-  能力自检 + **四个测试抓到的 bug + 独立审阅推翻的两条设计**（见上）。**测试 135 项全绿**
-  （islooping 28 · abort 12 · cancel 14 · dump 42 · empty-turn 19 · **p1b 20** · `samples/` 未污染）。
+  能力自检 + **四个测试抓到的 bug + 两轮独立审阅推翻的八条设计/口径**（见上）。**测试 140 项全绿**
+  （islooping 28 · abort 12 · cancel 14 · dump 42 · empty-turn 19 · **p1b 25** · `samples/` 未污染）。
   ⚠️ **重启 dsh 后必核三行**：`STEER-RESOLVE …` → `P1B-CAPABILITY …` → 真命中时的 `P1B-INJECT … via=…`；
   其中**自建兜底（`via=self-built`）已被独立审阅端到端验证**（append → deriveMessages → durable 回放全通、
   与官方构造器逐字段等价 ⇒ 见 `07-experiments/2026-10-07-p1b-inject-round1.md` §1）。
@@ -665,6 +666,19 @@ bash p1b-stats.sh /path/to/loop-fuse.log
 **发布默认值**：`p1bEnabled` **默认 `false`** —— 本项会**替使用者自动发消息**
 （以用户身份注入一句话），与 0.8.1 的 `probeMount` 同一套做法：**默认可移植/保守 + 本机覆盖**。
 要用的人自行在 `cordis.patch.yml` 里打开；作者本机就是显式 `p1bEnabled: true`。
+
+### 🔴 第 2 轮审阅后的收口（2026-10-07 · 又一次「测试/审阅才看得见」）
+
+| # | 发现（她的实测） | 改法 |
+|---|---|---|
+| 1 | 🔴 **默认参数下注入与掐断互相拆台**：`hit#1` 注入、`hit#2` 掐断，同 attempt 内相隔约 200 字符；而 `cancel(keepInbox)` **不清 inbox**、掐断后**不会自动开新 turn** ⇒ steer 要等用户下次发言才进 prompt ⇒ **观测永远只有 `segLen=0 / 观察中断`，真正消费它的那个 turn 一行都不测** | turn/end 时若 `segLen===0` 且 reason=`aborted` ⇒ **窗口带进下一个 turn**（≤1 次），日志 `P1B-OBSERVE-DEFER … turnsSpanned=1` |
+| 2 | 🔴 额度是**会话终身制** ⇒ 常驻会话样本天花板 2（脚本自己要求 n≥5 ⇒ 永远出不了结论）| 计数单位改 **episode**（`p1bEpisodeWindowMinutes` 衰减）；⑤ 线同款缺陷一并改 |
+| 3 | 建窗在 `.then` 里 ⇒ 与 turn/end **竞态** ⇒ 窗口成孤儿 ⇒ 可能出**假「有效」** | **同步建窗**（`steerHint` 之前）、`injected` 只作标志；未确认 ⇒ `verdict=注入未确认`（不进分母）；顺带修「上限只挡成功不挡尝试」 |
+| 4 | `segLen=0` 时 `drop=100%`（**假满分**）；两个 k24 窗口长度不可比 | 只在两窗等长时才给 `drop`，否则打 `—`；并打印 `k24BeforeWin/k24AfterWin` |
+| 5 | 新参数**没有 load-time 特征串**（违反本仓库自己立的规矩）| `loaded` 行加 `p1bEnabled / injectAtHit / observeN / steerMaxPerSession / episodeWinMin / dropPct / emptyTurnAction` |
+| 6 | **默认值没有测试钉住**（这条原则已被翻过一次）| `test-p1b.mjs` ⑰ 直接断言 `p1bEnabled=false` / `emptyTurnAction=log` / `probeMount=false` |
+
+📌 这也解释了「为什么重启后可能仍是 0 个有效样本」：改 1/2 之前，观测在**出厂参数下结构上**出不了一次可用结论。
 
 **生效方式**：`link:` + ESM 缓存 ⇒ 改完**必须重启 dsh**；重启后核对三行：
 `STEER-RESOLVE …`（解析成败）· `P1B-CAPABILITY …`（能力在不在）· 真命中时的 `P1B-INJECT … via=…`。

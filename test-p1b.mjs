@@ -84,9 +84,12 @@ function feed(ctx, agent, attemptId, text, turn = 1) {
   });
 }
 
-/** 结束一个 turn（观测窗口的关闭点） */
-function turnEnd(ctx, sid, turn = 1) {
-  return ctx.fire('session/event', { id: sid }, { type: 'turn/end', data: { turn } });
+/** 结束一个 turn（观测窗口的关闭点）；`reasonKind='aborted'` 用来复现「被掐断」那条路径 */
+function turnEnd(ctx, sid, turn = 1, reasonKind = null) {
+  return ctx.fire('session/event', { id: sid }, {
+    type: 'turn/end',
+    data: { turn, ...(reasonKind ? { reason: { kind: reasonKind } } : {}) },
+  });
 }
 
 /**
@@ -109,7 +112,7 @@ function hitOnce(ctx, agent, attemptId) {
   await sleep(400);
   const log = readLog();
   t('③ 命中即注入 · P1B-INJECT + agent.steer 被调用一次',
-    /P1B-INJECT session=s-inject attempt=a1 hit=1 via=(dsh-llm|self-built) /.test(log) && calls.steer.length === 1,
+    /P1B-INJECT session=s-inject .*attempt=a1 hit=1 via=(dsh-llm|self-built) /.test(log) && calls.steer.length === 1,
     log.match(/P1B-INJECT[^\n]*/)?.[0]?.slice(0, 110) ?? '(无日志)');
   t('④ 预注册参数已打印（observeN / dropPct / atChars / k24Before / quota）',
     /observeN=2000 dropPct=50 quota=1\/2/.test(log) && /atChars=\d+ k24Before=\d+/.test(log));
@@ -162,9 +165,9 @@ function hitOnce(ctx, agent, attemptId) {
   const log = readLog();
   t('⑩b 跨 attempt · 超过 p1bSteerMaxPerSession ⇒ P1B-INJECT-QUOTA，不再注入',
     count(log, /P1B-INJECT session=s-quota/g) === 1
-    && /P1B-INJECT-QUOTA session=s-quota attempt=b1 .*已注入 1\/1 次/.test(log)
+    && /P1B-INJECT-QUOTA session=s-quota .*已注入 1\/1 次/.test(log)
     && calls.steer.length === 1,
-    `INJECT=${count(log, /P1B-INJECT session=s-quota/g)} · steer=${calls.steer.length}`);
+    `INJECT=${count(log, /P1B-INJECT session=s-quota/g)} QUOTA=${count(log, /P1B-INJECT-QUOTA/g)} steer=${calls.steer.length}`);
 }
 
 // ── ⑭ SKIP / 未注入 ⇒ **不出 verdict**（否则有效率分母被污染）──────────────
@@ -260,6 +263,53 @@ function hitOnce(ctx, agent, attemptId) {
     && Object.isFrozen(m.content[0]) && Object.isFrozen(m.source);
   t('⑮ 自建消息满足回放侧四条 invariant（id/role/source.kind/content 数组）', okShape, `via=${r.via}`);
   t('⑮b 自建消息四层深冻结（dsh 按不可变值使用）', frozenDeep);
+}
+
+// ── ⑰ 默认值必须被钉住（拾遗 §Q3-1：这条原则已被翻过一次，下次照样能静默翻回去而全绿）──
+{
+  t('⑰ 发布包默认值：p1bEnabled=false · emptyTurnAction=log · probeMount=false',
+    DEFAULTS.p1bEnabled === false && DEFAULTS.emptyTurnAction === 'log' && DEFAULTS.probeMount === false
+    && DEFAULTS.p1bSteerMaxPerSession >= 1,
+    `p1bEnabled=${DEFAULTS.p1bEnabled} emptyTurnAction=${DEFAULTS.emptyTurnAction} probeMount=${DEFAULTS.probeMount}`);
+  t('⑰b 注入额度按 episode 计（有衰减窗口参数，不是会话终身制）',
+    typeof DEFAULTS.p1bEpisodeWindowMinutes === 'number' && DEFAULTS.p1bEpisodeWindowMinutes > 0,
+    `episodeWinMin=${DEFAULTS.p1bEpisodeWindowMinutes}`);
+}
+
+// ── ⑱ 被掐断且无新 attempt ⇒ 窗口**带进下一个 turn**（§1-1：否则永远只得到「观察中断」）──
+{
+  const ctx = mk();
+  const { agent } = mkAgent('s-defer');
+  hitOnce(ctx, agent, 'a1');                 // 注入（同步建窗）
+  await sleep(300);
+  turnEnd(ctx, 's-defer', 1, 'aborted');     // 被掐断，且该 attempt 之后再无文本
+  await sleep(250);
+  const log1 = readLog();
+  t('⑱ 被掐断且未被消费 ⇒ P1B-OBSERVE-DEFER（不关窗、不静默）',
+    /P1B-OBSERVE-DEFER session=s-defer .*turnsSpanned=1/.test(log1)
+    && !/P1B-OBSERVE session=s-defer/.test(log1),
+    log1.match(/P1B-OBSERVE-DEFER[^\n]*/)?.[0]?.slice(0, 110) ?? '(无日志)');
+  feed(ctx, agent, 'b1', BIG, 2);            // 下一个 turn 的文本才进读数
+  await sleep(300);
+  t('⑱b 带进来的窗口在下一个 turn 出结论（turnsSpanned=1）',
+    /P1B-OBSERVE session=s-defer .*turnsSpanned=1/.test(readLog()));
+}
+
+// ── ⑲ FAIL 也占额度（§1-5：通路坏了就该停手，而不是每个 step 再试一次）──
+{
+  const ctx = mk({ p1bSteerMaxPerSession: 1 });
+  const { agent, calls } = mkAgent('s-fail');
+  // 记录调用**再**抛错 —— 这样 `calls.steer.length` 就是"尝试次数"，正是 §1-5 要看的量
+  agent.steer = (...a) => { calls.steer.push(a); throw new Error('boom'); };
+  hitOnce(ctx, agent, 'a1');                 // 命中 ⇒ 尝试注入（同步预扣额度）
+  await sleep(350);
+  feed(ctx, agent, 'b1', A.repeat(8));       // 新 attempt 又命中 ⇒ 额度已用 ⇒ QUOTA
+  await sleep(400);
+  const log = readLog();
+  t('⑲ steer 恒抛错（FAIL）也占额度 ⇒ 第二次直接 QUOTA，不再反复试',
+    /P1B-INJECT-FAIL session=s-fail/.test(log) && /P1B-INJECT-QUOTA session=s-fail/.test(log)
+    && calls.steer.length === 1,
+    `FAIL=${count(log, /P1B-INJECT-FAIL session=s-fail/g)} QUOTA=${count(log, /P1B-INJECT-QUOTA session=s-fail/g)} steer=${calls.steer.length}`);
 }
 
 const bad = results.filter((r) => !r.ok);

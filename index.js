@@ -189,6 +189,11 @@ export const DEFAULTS = {
   //   **永久进 durable transcript**（`dsh-agent-loop:1028`）。姊妹插件 `loop-restart-exp` 的教训：
   //   「**steer 没有平台级限次保护**，无条件重启 = 自造死循环」。
   p1bSteerMaxPerSession: 2,
+  // ⚠️ 上面那个上限的**计数单位**（拾遗第 2 轮 §1-2）：按「循环 episode」而不是会话终身制。
+  //   会话级终身计数下，一个常驻会话的样本天花板就是 2，而统计脚本自己规定「n<5 不足以下结论」
+  //   ⇒ 重启后观察**在统计上不可能出结论**。现在：距上次注入超过本窗口 ⇒ 视为新 episode（计数归零）。
+  //   取 10 min 与 `stallMinutes` 同量级 —— "同一次失控"通常就在这个尺度内。
+  p1bEpisodeWindowMinutes: 10,
   textStrikesBeforeCancel: 2, // ① 线：**命中达此次数才掐断**（2026-09-30 新增；此前首次命中即掐）
   checkEvery: 200,   // 每新增这么多字符检查一次
   signalMaxAgeMinutes: 10, // 保存的 AbortSignal 超过此时长视为陈旧 ⇒ 不 abort（防御性，见 v0.3.3）
@@ -901,26 +906,56 @@ export const apply = (ctx, config) => {
   //     而"注入成功"的样本**更容易**落进 B（模型收尾快 ⇒ 攒不满 N）⇒ 样本系统性偏向"无效"。
   //   ⇒ 现在：**注入之后新出现的 attempt** 才开始累计；本 attempt 的剩余输出只记 `blindChars`；
   //     turn 结束仍未满 N ⇒ **补一行** `verdict=观察中断`（否则统计分母只包含"没救回来的那些"）。
-  /** @type {Map<string, {injectAttempt:string, k24Before:number, until:number, acc:string, blindChars:number, injected:boolean, atChars:number}>} */
+  /** @type {Map<string, {injectAttempt:string, openTurn:number|null, deferred:boolean, spans:number, k24Before:number, k24BeforeWin:number, until:number, acc:string, blindChars:number, injected:boolean, atChars:number}>} */
   const p1bPending = new Map();
-  /** 每会话已注入次数（**上限**见 `p1bSteerMaxPerSession`） @type {Map<string, number>} */
+  /**
+   * ①c 注入额度：**按「循环 episode」计数，不是会话终身制**（拾遗第 2 轮 §1-2 实测）。
+   * 为什么必须改单位：会话级终身计数下，一个常驻会话的样本天花板 = `p1bSteerMaxPerSession`（2），
+   *   而统计脚本自己规定「n<5 不足以下结论」⇒ **重启后观察在统计上不可能出结论**。
+   * 现在：同一次失控（窗口内）最多 2 次；距上次注入超过 `p1bEpisodeWindowMinutes` ⇒ 视为新 episode。
+   * @type {Map<string, {count:number, lastAt:number}>}
+   */
   const p1bSteeredBySession = new Map();
+  /** 取/衰减 episode 计数（⑤ 线共用同一套语义，见 §Q3-2） */
+  const episodeOf = (map, sid, now, ttlMinutes) => {
+    const rec = map.get(sid);
+    const ttl = Math.max(1, ttlMinutes ?? 10) * 60000;
+    if (!rec || now - rec.lastAt > ttl) return { count: 0, lastAt: now };
+    return { count: rec.count, lastAt: rec.lastAt };
+  };
 
-  /** 出观测结论（正常观察满 N / turn 结束中断，两种都走这里 ⇒ 分母完整） */
-  const emitP1bObserve = (p, agentRef, sid, interrupted = false) => {
+  /**
+   * 出观测结论。四条出口都走这里（观察满 N / turn 结束 / 跨 turn / 被新窗口顶掉）⇒ **分母完整**。
+   * @param extra 附加上下文（turnEndReason / why 等），只进日志
+   */
+  const emitP1bObserve = (p, agentRef, sid, interrupted = false, extra = {}) => {
     try {
+      const afterWin = Math.min(p.acc.length, cfg.p1bObserveChars);
       const k24After = k24Max(p.acc.slice(-cfg.p1bObserveChars));
       // ⚠️ 读数 2 的口径 = **注入之后新 attempt 的累计文本**（不是整个 buf、也不是本 attempt 的尾巴）
       const still = p.acc.length >= cfg.minChars ? isLooping(p.acc, cfg) : null; // null = 观察量不足
-      const drop = p.k24Before > 0 ? Math.round((1 - k24After / p.k24Before) * 100) : 0;
-      const ok = !interrupted && p.injected === true && p.k24Before > 0
+      // ⚠️ `drop` 只在**两个 k24 窗口等长**时才可比（§1-4）：`k24Max` 对周期文本 ≈ (len-23)/period，
+      //   **线性于窗口长度**；而 k24Before 的窗口是 min(buf, N) ⇒ 注入早时窗口更小、k24 更小，
+      //   算出来的 drop 会虚高甚至为负。interrupted 更是"零观测"（segLen=0 ⇒ k24After=0 ⇒ drop=100%），
+      //   那一行看起来像「完美见效」—— 所以这两种情况一律打 `—`。
+      const comparable = !interrupted && p.k24Before > 0 && p.k24BeforeWin === afterWin && afterWin > 0;
+      const drop = comparable ? Math.round((1 - k24After / p.k24Before) * 100) : null;
+      const ok = comparable && p.injected === true
         && k24After <= p.k24Before * (1 - cfg.p1bSuccessDropPct / 100) && still === false;
-      const verdict = interrupted ? '观察中断' : (ok ? '有效' : (still === true ? '无效' : '不确定'));
+      // `注入未确认` = 窗口建了但 steerHint 还没 resolve（§1-3a）⇒ **不进效果层分母**
+      const verdict = interrupted ? '观察中断'
+        : (p.injected !== true ? '注入未确认' : (ok ? '有效' : (still === true ? '无效' : '不确定')));
+      const ctx = Object.entries(extra).filter(([, v]) => v != null).map(([k, v]) => `${k}=${v}`).join(' ');
       note(`P1B-OBSERVE session=${sid ?? '?'} attempt=${p.injectAttempt} N=${cfg.p1bObserveChars} `
-         + `segLen=${p.acc.length} blindChars=${p.blindChars} k24Before=${p.k24Before} k24After=${k24After} `
-         + `drop=${drop}% line1StillHits=${still} injected=${p.injected} verdict=${verdict} `
+         + `segLen=${p.acc.length} blindChars=${p.blindChars} k24Before=${p.k24Before} k24BeforeWin=${p.k24BeforeWin} `
+         + `k24After=${k24After} k24AfterWin=${afterWin} drop=${drop == null ? '—' : drop + '%'} `
+         + `line1StillHits=${still} injected=${p.injected} verdict=${verdict} `
+         + `turnsSpanned=${p.spans ?? 0}${ctx ? ' ' + ctx : ''} `
          + `—— ⚠️ 基础率 2/6 ⇒ 单次只作记录、不作结论`);
-    } catch { /* 观测绝不影响会话事件链 */ }
+    } catch (e) {
+      // ⚠️ 这里**不许静默**（§1-6）：本文件对注入侧的纪律是「SKIP/FAIL 必须留痕」，观测侧同理。
+      try { note(`P1B-OBSERVE-FAIL session=${sid ?? '?'} attempt=${p?.injectAttempt ?? '?'} ${String(e).slice(0, 160)}`); } catch { /* ignore */ }
+    }
     void agentRef;
   };
 
@@ -956,11 +991,18 @@ export const apply = (ctx, config) => {
     {
       const pend = sidOfFrame ? p1bPending.get(sidOfFrame) : null;
       if (pend && c.text) {
-        if (frame.attemptId === pend.injectAttempt) pend.blindChars += c.text.length;
-        else pend.acc += c.text;
-        if (pend.acc.length >= pend.until) {
+        const curTurn = lastTurnByAgent.get(agent) ?? frame.turn ?? null;
+        // §1-3b：跨 turn ⇒ **先结算再累计**（否则两个 turn 的文本混进同一个窗，还会被下一次注入覆盖）
+        if (!pend.deferred && pend.openTurn != null && curTurn != null && curTurn !== pend.openTurn) {
           p1bPending.delete(sidOfFrame);
-          emitP1bObserve(pend, agent, sidOfFrame);
+          emitP1bObserve(pend, agent, sidOfFrame, true, { why: 'turn-changed' });
+        } else {
+          if (frame.attemptId === pend.injectAttempt) pend.blindChars += c.text.length;
+          else pend.acc += c.text;
+          if (pend.acc.length >= pend.until) {
+            p1bPending.delete(sidOfFrame);
+            emitP1bObserve(pend, agent, sidOfFrame);
+          }
         }
       }
     }
@@ -988,48 +1030,62 @@ export const apply = (ctx, config) => {
         if (cfg.p1bEnabled !== false && !st.p1bDone && st.hits >= (cfg.p1bInjectAtHit ?? 1)) {
           st.p1bDone = true;
           const steerMax = Math.max(1, cfg.p1bSteerMaxPerSession ?? 2);
-          const steerUsed = sid ? (p1bSteeredBySession.get(sid) ?? 0) : 0;
-          if (sid && steerUsed >= steerMax) {
-            note(`P1B-INJECT-QUOTA session=${sid} attempt=${frame.attemptId} —— 本会话已注入 `
-               + `${steerUsed}/${steerMax} 次，跳过（上限见 p1bSteerMaxPerSession）`);
-          } else {
-          const win = Math.min(st.buf.length, cfg.p1bObserveChars);
-          const p = {
-            injectAttempt: frame.attemptId,
-            atChars: st.buf.length,
-            until: cfg.p1bObserveChars,
-            k24Before: k24Max(st.buf.slice(-win)),
-            acc: '',
-            blindChars: 0,
-            injected: false,
-          };
+          const now = Date.now();
+          const ep = episodeOf(p1bSteeredBySession, sid, now, cfg.p1bEpisodeWindowMinutes);
           const hitAt = st.hits;
-          if (agent && typeof agent.steer === 'function') {
-            // ⚠️ 动态 import ⇒ 不能阻塞流式事件链；**成败都留痕**（本项替使用者发消息，不许静默）
-            steerHint(agent, cfg.p1bHint, name).then((via) => {
-              p.injected = true;
-              // ✅ 观测只在**注入成功之后**才开始（拾遗 §2.2：SKIP/FAIL 若也出 verdict，
-              //    有效率的分母就被"根本没注入"的样本污染）
-              if (sid) {
-                p1bPending.set(sid, p);
-                p1bSteeredBySession.set(sid, steerUsed + 1);
-              }
-              note(`P1B-INJECT session=${sid ?? '?'} attempt=${frame.attemptId} hit=${hitAt} via=${via} `
-                 + `atChars=${p.atChars} k24Before=${p.k24Before} observeN=${cfg.p1bObserveChars} `
-                 + `dropPct=${cfg.p1bSuccessDropPct} quota=${steerUsed + 1}/${steerMax} —— 预注册参数已打印；`
-                 + `⚠️ 基础率 2/6（本簇 6 段真循环有 2 段自愈）⇒ 单次结果只作记录、不作证据`);
-            }).catch((e) => {
-              note(`P1B-INJECT-FAIL session=${sid ?? '?'} attempt=${frame.attemptId} ${String(e).slice(0, 160)}`);
-            });
+          const canSteer = Boolean(agent && typeof agent.steer === 'function');
+          if (sid && canSteer && ep.count >= steerMax) {
+            note(`P1B-INJECT-QUOTA session=${sid} turn=${lastTurnByAgent.get(agent) ?? '?'} `
+               + `attempt=${frame.attemptId} —— 本 episode 已注入 ${ep.count}/${steerMax} 次`
+               + `（窗口 ${cfg.p1bEpisodeWindowMinutes} min），跳过`);
           } else {
-            note(`P1B-INJECT-SKIP session=${sid ?? '?'} attempt=${frame.attemptId} —— agent 无 steer（拿不到能力）`);
-          }
+            const win = Math.min(st.buf.length, cfg.p1bObserveChars);
+            const p = {
+              injectAttempt: frame.attemptId,
+              openTurn: lastTurnByAgent.get(agent) ?? frame.turn ?? null,
+              deferred: false,
+              spans: 0,
+              atChars: st.buf.length,
+              until: cfg.p1bObserveChars,
+              k24Before: k24Max(st.buf.slice(-win)),
+              k24BeforeWin: win,
+              acc: '',
+              blindChars: 0,
+              injected: false,   // ← 配额**同步预扣**（§1-5）：不等 `.then`，FAIL 也不退
+            };
+            if (sid && canSteer) {
+              // §1-3a：**同步建窗**（原来在 `.then` 里建 ⇒ 与 turn/end 竞态 ⇒ 窗口成孤儿 ⇒ 假「有效」）
+              const prev = p1bPending.get(sid);
+              if (prev) {
+                p1bPending.delete(sid);
+                emitP1bObserve(prev, agent, sid, true, { why: 'replaced' });
+              }
+              p1bPending.set(sid, p);
+              p1bSteeredBySession.set(sid, { count: ep.count + 1, lastAt: now });
+            }
+            if (canSteer) {
+              // ⚠️ 动态 import ⇒ 不能阻塞流式事件链；**成败都留痕**（本项替使用者发消息，不许静默）
+              steerHint(agent, cfg.p1bHint, name).then((via) => {
+                p.injected = true;   // 只翻标志；窗口早在上面建好了
+                note(`P1B-INJECT session=${sid ?? '?'} turn=${lastTurnByAgent.get(agent) ?? '?'} `
+                   + `attempt=${frame.attemptId} hit=${hitAt} via=${via} `
+                   + `atChars=${p.atChars} k24Before=${p.k24Before} k24BeforeWin=${p.k24BeforeWin} `
+                   + `observeN=${cfg.p1bObserveChars} dropPct=${cfg.p1bSuccessDropPct} `
+                   + `quota=${ep.count + 1}/${steerMax} —— 预注册参数已打印；`
+                   + `⚠️ 基础率 2/6（本簇 6 段真循环有 2 段自愈）⇒ 单次结果只作记录、不作证据`);
+              }).catch((e) => {
+                note(`P1B-INJECT-FAIL session=${sid ?? '?'} attempt=${frame.attemptId} ${String(e).slice(0, 160)}`
+                   + ` —— ⚠️ 额度不退（§1-5：通路坏了就该停手，不该每个 step 再试一次）`);
+              });
+            } else {
+              note(`P1B-INJECT-SKIP session=${sid ?? '?'} attempt=${frame.attemptId} —— agent 无 steer（拿不到能力）`);
+            }
           }
         }
         // v0.3.3 节流：同一 attempt 命中多次只记 1、6、11… 次（原实现一次命中写一行，
         //   实测同一 attempt 写了 6 行 `hits=1→6`）。
         if (st.hits % 5 === 1) {
-          note(`DETECT attempt=${frame.attemptId} turn=${turn ?? '?'} len=${st.buf.length} `
+          note(`DETECT attempt=${frame.attemptId} len=${st.buf.length} `
              + `kind=${st.kind} hits=${st.hits} hasSignal=${Boolean(sig)} stale=${stale} `
              + `canCancel=${typeof agent?.cancel === 'function'} dryRun=${cfg.dryRun}`);
         }
@@ -1037,7 +1093,7 @@ export const apply = (ctx, config) => {
         if (cfg.dryRun || st.canceled) { /* 观测模式 / 本 attempt 已掐过 ⇒ 不动手 */ }
         else if (st.hits < cfg.textStrikesBeforeCancel) {
           // 2026-09-30 降敏：首次命中先只观察，避免"长思考里反复引用同一段配置"被误杀
-          note(`STRIKE-PENDING attempt=${frame.attemptId} turn=${turn ?? '?'} len=${st.buf.length} `
+          note(`STRIKE-PENDING attempt=${frame.attemptId} len=${st.buf.length} `
              + `hits=${st.hits}/${cfg.textStrikesBeforeCancel} —— 首次命中，继续观察；再次命中才掐断`);
         } else {
           // v0.4.0-B：文本线是**强信号** ⇒ 也计入 strike 池（③线跨 turn 累计用）
@@ -1057,7 +1113,7 @@ export const apply = (ctx, config) => {
                 { keepInbox: cfg.cancelKeepInbox },
               );
               st.canceled = true;
-              note(`ABORT-VIA-CANCEL session=${sid ?? '?'} turn=${turn ?? '?'} `
+              note(`ABORT-VIA-CANCEL session=${sid ?? '?'} attempt=${frame.attemptId} `
                  + `len=${st.buf.length} hits=${st.hits} keepInbox=${cfg.cancelKeepInbox} `
                  + `cause=hook ← 文本重复判定为循环，已中止该 turn`);
               noteCancel(`CANCEL source=text-loop session=${sid ?? '?'} turn=${turn ?? '?'} `
@@ -1079,7 +1135,7 @@ export const apply = (ctx, config) => {
             }
           }
           if (!st.canceled) {
-            note(`ABORT-SKIP attempt=${frame.attemptId} turn=${turn ?? '?'} —— 检测到循环但没有可用中止原语`
+            note(`ABORT-SKIP attempt=${frame.attemptId} —— 检测到循环但没有可用中止原语`
                + `（canCancel=${typeof agent?.cancel === 'function'} hasAbortableSignal=`
                + `${Boolean(sig && typeof sig.abort === 'function')}）`);
           }
@@ -1157,9 +1213,12 @@ export const apply = (ctx, config) => {
       });
       if (action !== 'steer') return;
       const maxSteer = Math.max(0, cfg.emptyTurnSteerMax ?? 3);
-      const used = emptyTurnSteered.get(sid) ?? 0;
+      // ⚠️ 与 ①c **同一套语义**（拾遗 §Q3-2）：按 episode 计数，不再是会话终身制 ——
+      //   否则一个常驻会话里第 3 次以后的零正文 turn 永远不会被补救（同一原则两处必须一起动）。
+      const now05 = Date.now();
+      const used = episodeOf(emptyTurnSteered, sid, now05, cfg.p1bEpisodeWindowMinutes).count;
       if (used >= maxSteer) {
-        note(`EMPTY-TURN-STEER-SKIP session=${sid} —— 本会话已补救 ${used}/${maxSteer} 次`);
+        note(`EMPTY-TURN-STEER-SKIP session=${sid} —— 本 episode 已补救 ${used}/${maxSteer} 次`);
         return;
       }
       const ag = agentsBySession.get(sid);
@@ -1169,7 +1228,7 @@ export const apply = (ctx, config) => {
       }
       // ⚠️ 与 ①c P1-b 共用 `steerHint()` —— 内部含动态 import + 失败降级。
       steerHint(ag, cfg.emptyTurnHint, name).then((via) => {
-        emptyTurnSteered.set(sid, used + 1);
+        emptyTurnSteered.set(sid, { count: used + 1, lastAt: now05 });
         note(`EMPTY-TURN-STEER session=${sid} turn=${st.turn} via=${via}（第 ${used + 1}/${maxSteer} 次）`);
       }).catch((e) => {
         note(`EMPTY-TURN-STEER-FAIL session=${sid} ${String(e).slice(0, 160)}`);
@@ -1216,8 +1275,23 @@ export const apply = (ctx, config) => {
         //   ⇒ 效果层的率会被系统性拉成"无效"。
         const pendEnd = p1bPending.get(sid);
         if (pendEnd) {
-          p1bPending.delete(sid);
-          emitP1bObserve(pendEnd, agentsBySession.get(sid), sid, true);
+          const reasonKind = d.reason?.kind ?? null;
+          // §1-1（拾遗第 2 轮 🔴）：默认参数下 ① 线是「hit#1 注入、hit#2 掐断」，两者同 attempt 内
+          //   相隔约 `checkEvery`(200) 字符；而 `cancel(keepInbox:true)` **不清 inbox**、掐断后
+          //   **不会自动开新 turn**（`wakeAfterAbort=false`）⇒ 那条 steer 要等**用户下次发言**才进 prompt。
+          //   若此时就关窗口 ⇒ 永远只得到 `segLen=0 / 观察中断`，而**真正消费 steer 的那个 turn 一行都不测**。
+          //   ⇒ 判据现成：`segLen===0` ⇔ 没有任何新 attempt 消费过它。此时**把窗口带进下一个 turn**
+          //     （最多 1 次，防无限悬挂），并在日志里明记。
+          if (pendEnd.acc.length === 0 && reasonKind === 'aborted' && (pendEnd.spans ?? 0) < 1) {
+            pendEnd.spans = (pendEnd.spans ?? 0) + 1;
+            pendEnd.deferred = true;
+            note(`P1B-OBSERVE-DEFER session=${sid} attempt=${pendEnd.injectAttempt} `
+               + `turnEndReason=${reasonKind} turnsSpanned=${pendEnd.spans} —— 注入尚未被消费`
+               + `（本 turn 被掐断且无新 attempt），窗口带进下一个 turn`);
+          } else {
+            p1bPending.delete(sid);
+            emitP1bObserve(pendEnd, agentsBySession.get(sid), sid, true, { turnEndReason: reasonKind });
+          }
         }
         turns.delete(`${sid}#${d.turn}`);
         killed.delete(`${sid}#${d.turn}`);   // 2026-10-03：turn 结束即清（条目已无用，防 Set 无限增长）
@@ -1399,6 +1473,12 @@ export const apply = (ctx, config) => {
   note(`loaded v${VERSION} lowDivDetect=${cfg.lowDivDetect} lowDivMaxUniq=${cfg.lowDivMaxUniq} `
      + `lowDivSlideDetect=${cfg.lowDivSlideDetect} slideWin=${cfg.lowDivSlideWin} `
      + `slideStep=${cfg.lowDivSlideStep} slideUniq=${cfg.lowDivSlideUniq} slideMinRepeat=${cfg.lowDivSlideMinRepeat}`);
+  // §1-8：①c/⑤ 的**行为参数必须有 load-time 特征串** —— 否则"日志里没有 P1B-* 行"时
+  //   无法区分「没触发」与「跑的是旧代码」（本仓库自己立的规矩，见上面那段注释）。
+  note(`loaded v${VERSION} p1bEnabled=${cfg.p1bEnabled} injectAtHit=${cfg.p1bInjectAtHit} `
+     + `observeN=${cfg.p1bObserveChars} steerMaxPerSession=${cfg.p1bSteerMaxPerSession} `
+     + `episodeWinMin=${cfg.p1bEpisodeWindowMinutes} dropPct=${cfg.p1bSuccessDropPct} `
+     + `emptyTurnAction=${cfg.emptyTurnAction} emptyTurnSteerMax=${cfg.emptyTurnSteerMax}`);
 
   // ─────────────────────────────────────────────────────────────────────
   // ⚠️ 可选挂载点（**维护者本机的实验代码，不属于本项目的功能**）
