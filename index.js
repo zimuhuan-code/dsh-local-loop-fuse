@@ -1137,6 +1137,15 @@ export const apply = (ctx, config) => {
      + `dumpDenylistPath=${cfg.dumpDenylistPath}`);
   note(`loaded v${VERSION} emptyTurnDetect=${cfg.emptyTurnDetect} emptyTurnLimit=${cfg.emptyTurnLimit} `
      + `emptyTurnAction=${cfg.emptyTurnAction} emptyTurnSteerMax=${cfg.emptyTurnSteerMax}`);
+  // ⚠️ 为什么把 ①b/①b-2 参数也打出来（2026-10-07 加）：**代码改动没有"特征串"就没法判生效**。
+  //    本机踩过两次：① `loaded v0.8.1` 的版本号是**运行时读 package.json** ⇒ 旧代码进程重启后
+  //    照样打印新版本号；② 滑窗支加完时，`loaded` 行**一个字都没变** ⇒ 只能靠
+  //    "进程启动时间 > index.js mtime" 这种外部判据。打出来之后，**一行 grep 就能判**。
+  //    ⚠️ 注意：**hot 重载也会打印本行**（它 ≠ 换掉代码 —— `link:` + ESM 缓存）⇒
+  //    看见本行**不代表**新代码在跑；判定仍要用「进程启动时间 > 代码 mtime」。
+  note(`loaded v${VERSION} lowDivDetect=${cfg.lowDivDetect} lowDivMaxUniq=${cfg.lowDivMaxUniq} `
+     + `lowDivSlideDetect=${cfg.lowDivSlideDetect} slideWin=${cfg.lowDivSlideWin} `
+     + `slideStep=${cfg.lowDivSlideStep} slideUniq=${cfg.lowDivSlideUniq} slideMinRepeat=${cfg.lowDivSlideMinRepeat}`);
 
   // ─────────────────────────────────────────────────────────────────────
   // ⚠️ 可选挂载点（**维护者本机的实验代码，不属于本项目的功能**）
