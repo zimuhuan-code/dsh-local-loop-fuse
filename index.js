@@ -139,6 +139,22 @@ export const DEFAULTS = {
                            //   **未标注的真循环**（`aed7127e` 的 do-it 循环）⇒ **该数字待"真循环标注集"建好后重验**。
                            // 📌 机主原话：「**阈值可以先给 45，慢慢调整 —— 实践的样本永远是最好的**」。
   lowDivMinRepeat: 10,     // 同一 lowDivNgram 片段在窗口内出现次数下限
+  // ── ①b-2 滑窗支（2026-10-07 机主授权加）────────────────────────────────
+  // 为什么必须加：① 与 ①b（末窗）**都只看末尾 2000 字符**，会被正常部分的词汇**稀释**
+  //   ⇒ 「**正常推理里夹一段空转**」这种**最自然的循环形态**在结构上抓不到。
+  //   实测（`seq 14872` · turn 308 · 第 2 次自愈）：整段 `uniq=247` ⇒ 末窗判据全不命中；
+  //   而按 400 字符滑窗其最小 `uniq=29`（循环段约 900 字符，结尾 `I must stop. Calling the tool now.`）。
+  // ⚠️ **阈值必须与口径配套，不能共用**：实测（160 会话 / 5,013 块）
+  //   末窗(2000) 下 45 可用（机主定）；**滑窗(400) 下 45 误报 850 块（17%）**，
+  //   滑窗 `uniq<30` 才回到可用区。⇒ 故本支**独立阈值**，不复用 `lowDivMaxUniq`。
+  lowDivSlideDetect: true,   // 滑窗支总开关（false = 退回只有末窗口径）
+  lowDivSlideWin: 400,       // 滑窗窗口（字符）
+  lowDivSlideStep: 100,      // 滑窗步长（字符）
+  lowDivSlideUniq: 30,       // 滑窗内唯一字符数上限（实测：<30 ⇒ 真循环 5/5 召回）
+  // ⚠️ 滑窗支的 ② 条件门槛**非常低**（2，不是末窗支的 10）—— 由测试 `④b 模板化列表` 逼出来：
+  //   在「min-uniq 窗口」内实测 k24：真循环 `2/3/3/5/9` vs **模板列表 `1`**
+  //   ⇒ 门槛取 2 就能挡住模板列表、又不漏真循环。**别再抬高**（会漏 `14872`/`14922`）。
+  lowDivSlideMinRepeat: 2,   // 滑窗内 k-gram 重复次数下限（窗口内计算，不跨窗）
   textStrikesBeforeCancel: 2, // ① 线：**命中达此次数才掐断**（2026-09-30 新增；此前首次命中即掐）
   checkEvery: 200,   // 每新增这么多字符检查一次
   signalMaxAgeMinutes: 10, // 保存的 AbortSignal 超过此时长视为陈旧 ⇒ 不 abort（防御性，见 v0.3.3）
@@ -265,9 +281,16 @@ export function isLoopingExact(buf, cfg) {
  *   上膛前建议再攒样本；要回退只需 `lowDivDetect: false`。
  */
 export function isLowDiversityLoop(buf, cfg) {
+  if (isLowDivTail(buf, cfg)) return true;                    // ①b 末窗口径
+  if (cfg.lowDivSlideDetect !== false && isLowDivSliding(buf, cfg)) return true;  // ①b-2 滑窗口径
+  return false;
+}
+
+/** ①b **末窗口径**（原实现）—— 抓「**整段单调**」型 */
+function isLowDivTail(buf, cfg) {
   const win = cfg.lowDivWindow ?? 2000;
   const k = cfg.lowDivNgram ?? 24;
-  const maxUniq = cfg.lowDivMaxUniq ?? 40;
+  const maxUniq = cfg.lowDivMaxUniq ?? 45;
   const minRepeat = cfg.lowDivMinRepeat ?? 10;
   if (buf.length < win) return false;          // 样本不足整个窗口 ⇒ 不判（保守）
   const seg = buf.slice(-win);
@@ -278,6 +301,45 @@ export function isLowDiversityLoop(buf, cfg) {
     const n = (seen.get(g) ?? 0) + 1;
     if (n >= minRepeat) return true;           // ② 已达下限 ⇒ 立即返回（不必跑满窗口）
     seen.set(g, n);
+  }
+  return false;
+}
+
+/**
+ * ①b-2 **滑窗口径**（2026-10-07 机主授权新增）—— 抓「**局部循环 + 整段词汇丰富**」型
+ *
+ * 为什么必须单列一支：末窗只看末尾 2000 字符，正常部分的词汇会把 `uniq` **抬上去**
+ *   ⇒ 「正常推理里夹一段空转」在结构上抓不到。实测 `seq 14872`（turn 308 · 第 2 次自愈）：
+ *   整段 `uniq=247`（末窗两条件全不命中），按 400 字符滑窗最小 **`uniq=29`**。
+ *
+ * ⚠️ **本支也是两条件，但 ② 的门槛与末窗支不同**（`k24 ≥ 2` vs 末窗支的 `≥ 10`）—— 实测逼出来的：
+ *   · 在 **2000 字符**窗口上算，局部循环的 `k16` 只有 **1–3**（每轮夹噪声 `d`/`执行。`/`I must call…`）
+ *     ⇒ 若沿用末窗支的 `≥10`，这一支**永远不命中**（这正是末窗支最大的盲区）；
+ *   · 但在**同一个 400 字符窗口内**算 `k24`：真循环可达 **`2/3/3/5/9`**，而**模板化列表只有 `1`**
+ *     （数字变化打断 24-gram）⇒ **门槛取 2 恰好分开两者**。
+ *   📌 这条门槛是**测试逼出来的**：本支初版「只看 uniq」时，`④b 模板化列表` 被判 `true`（误杀）。
+ *
+ * 实测依据（160 会话 / 5,013 长文本块）：末窗 45 可用；**滑窗 45 误报 850 块（17%）**，
+ *   滑窗 `uniq<30` 才回到可用区。⚠️ 但"误报"未甄别（混有未标注真循环，如 `aed7127e`）
+ *   ⇒ **精确误报率待"真循环标注集"建好后重验**。
+ */
+function isLowDivSliding(buf, cfg) {
+  const win = cfg.lowDivSlideWin ?? 400;
+  const step = cfg.lowDivSlideStep ?? 100;
+  const maxUniq = cfg.lowDivSlideUniq ?? 30;
+  const k = cfg.lowDivNgram ?? 24;
+  const minRepeat = cfg.lowDivSlideMinRepeat ?? 2;
+  if (buf.length < win) return false;
+  for (let end = win; end <= buf.length; end += step) {
+    const seg = buf.slice(end - win, end);
+    if (new Set(seg).size >= maxUniq) continue;      // ① 该窗口用词够丰富 ⇒ 跳过
+    const seen = new Map();                          // ② **该窗口内** k-gram 重复 ≥ minRepeat
+    for (let i = 0; i + k <= seg.length; i++) {
+      const g = seg.slice(i, i + k);
+      const n = (seen.get(g) ?? 0) + 1;
+      if (n >= minRepeat) return true;
+      seen.set(g, n);
+    }
   }
   return false;
 }

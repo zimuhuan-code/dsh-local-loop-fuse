@@ -75,6 +75,34 @@ t('⑦ 带噪声的交替空转（该触发）', noisy, true);
   console.log(`${ok ? '✅' : '❌'}  ⑦b 同一样本：exact=false(${exact}) 且 lowDiv=true(${lowDiv}) —— 证明是新判据抓的`);
 }
 
+// ── ⑧ 局部循环（整段词汇丰富 + 中段空转）—— **滑窗支**（①b-2）的回归样本 ──────────
+// 为什么单列：① 与 ①b 都只看**末尾 2000 字符**，正常部分的词汇会把 uniq 抬上去 ⇒
+//   「正常推理里夹一段空转」**结构上抓不到**。真实事故里 `seq 14872`（turn 308 · 第 2 次自愈）
+//   整段 `uniq=247`、滑窗最小 `29`。
+// ⚠️ 本样本是**合成的、不含任何真实对话原文**（仓库是 public）。
+const mkLocalLoop = () => {
+  const normal = Array.from({ length: 60 },
+    (_, i) => `第 ${i} 步：核对 /mnt/models/x${i}.json 的第 ${i * 7} 行，确认参数与预期一致。`).join('\n');
+  const frags = ['（停）', '（调用）', '（结束）', '（执行）', '（现在）'];
+  let loop = '';
+  for (let i = 0; i < 200; i++) {
+    loop += frags[i % frags.length] + '\n\n';
+    if (i % 17 === 0) loop += 'd\n\n';
+    if (i % 23 === 0) loop += 'I must call the tool.\n\n';
+  }
+  return normal + '\n\n做。\n\n' + loop;
+};
+const localLoop = mkLocalLoop();
+t('⑧ 局部循环 + 整段词汇丰富（该触发）', localLoop, true);
+{
+  // ⑧b：**关掉滑窗支必须变 false** ⇒ 证明这次是滑窗支抓的（防"改回只有末窗的版本还显示全绿"）
+  const tailOnly = isLowDiversityLoop(localLoop, { ...cfg, lowDivSlideDetect: false });
+  const withSlide = isLowDiversityLoop(localLoop, cfg);
+  const ok = tailOnly === false && withSlide === true;
+  results.push({ name: '⑧b 关滑窗支必须 false、默认必须 true', ok });
+  console.log(`${ok ? '✅' : '❌'}  ⑧b 同一合成样本：关滑窗支(${tailOnly}) 必须 false、默认(${withSlide}) 必须 true`);
+}
+
 // ── 行动层（v0.4.0）单测：checkStall（「无进展」判据）─────────────────────
 // ⛔ 旧判据 `maxTurnMinutes`（墙钟时长）/ `maxStepsPerTurn`（步数）**已删除**：
 //    2026-10-01 实测两个正常长 turn（15.7 / 15.6 min、全程有产出）被 duration 判据误杀，
