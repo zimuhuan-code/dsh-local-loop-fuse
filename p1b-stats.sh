@@ -21,7 +21,15 @@
 set -uo pipefail
 DEFAULT_LOG="${DSH_HOME:-$HOME/.dsh}/logs/dsh-local-loop-fuse/loop-fuse.log"
 LOG="${1:-$DEFAULT_LOG}"
-[ -f "$LOG" ] || { echo "❌ 日志不存在：$LOG"; exit 1; }
+if [ ! -f "$LOG" ]; then
+  echo "❌ 日志不存在：$LOG"
+  echo
+  echo "   ⚠️ 很多实例会用 cordis.patch.yml 把 logPath 钉到别处（默认值只是**可移植的兜底**）。"
+  echo "   先看本实例实际写在哪儿，再把它作为参数传进来："
+  echo "     grep -rn -A3 'dsh-local-loop-fuse' \"\${DSH_HOME:-\$HOME/.dsh}/profiles/*/cordis.patch.yml\" | grep logPath"
+  echo "     bash $0 <上面那行的路径>"
+  exit 1
+fi
 
 c() { grep -ac -- "$1" "$LOG" 2>/dev/null | head -1; }
 pct() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b+0==0) printf "—"; else printf "%.0f%%", a*100/b }'; }
@@ -54,13 +62,24 @@ line '  └ FAIL（抛错）' "$ifa" "$((ij + isk + ifa))"
 line '  └ 其中 via=dsh-llm' "$(c 'P1B-INJECT .*via=dsh-llm')" "$ij"
 line '  └ 其中 via=self-built' "$(c 'P1B-INJECT .*via=self-built')" "$ij"
 echo
-echo "【③ 效果层 —— 注入后观测（双读数）】"
-v_ok=$(c 'P1B-OBSERVE.*verdict=有效'); v_no=$(c 'P1B-OBSERVE.*verdict=无效'); v_un=$(c 'P1B-OBSERVE.*verdict=不确定')
-line '有效（k24 降 & 注入后不再循环）' "$v_ok" "$((v_ok + v_no + v_un))"
-line '无效（注入后仍循环）' "$v_no" "$((v_ok + v_no + v_un))"
-line '不确定' "$v_un" "$((v_ok + v_no + v_un))"
+echo "【③ 效果层 —— 注入后观测（双读数 · **只看注入成功的样本**）】"
+# ⚠️ 必须按 `injected=true` 过滤（拾遗第 3 轮 §2.2 实测）：早期实现里 SKIP/FAIL 也会产出 verdict
+#   ⇒ 有效率的分母被"根本没注入"的样本污染。现在代码侧已修（未注入不建观测），
+#   这里再过滤一次是**对历史日志的防御**。
+v_ok=$(c 'P1B-OBSERVE.*injected=true.*verdict=有效')
+v_no=$(c 'P1B-OBSERVE.*injected=true.*verdict=无效')
+v_un=$(c 'P1B-OBSERVE.*injected=true.*verdict=不确定')
+v_cut=$(c 'P1B-OBSERVE.*verdict=观察中断')
+v_tot=$((v_ok + v_no + v_un))
+line '有效（k24 降 & 注入后不再循环）' "$v_ok" "$v_tot"
+line '无效（注入后仍循环）' "$v_no" "$v_tot"
+line '不确定' "$v_un" "$v_tot"
+printf '   %-30s %s\n' '观察中断（turn 结束未满 N）' "$v_cut"
+printf '   %-30s %s\n' '撞每会话上限（INJECT-QUOTA）' "$(c 'P1B-INJECT-QUOTA')"
 echo "   📌 对照基线：本簇真循环的**基础自愈率 = 2/6 ≈ 33%**（307/308 自愈 · 309/311/313 被按停）"
 echo "      ⇒ 注入有效率**必须与它比**；单次有效不作证据。"
+echo "   📌 「观察中断」是**必须看**的一栏：它高 ⇒ 说明观测窗口（p1bObserveChars，默认 2000）"
+echo "      有效率的分母会偏小（只有跑满 N 的那些算数）。"
 echo
 echo "【④ ⑤ 线（零正文 turn）—— 同一 steer API】"
 e_ok=$(c 'EMPTY-TURN-STEER session'); e_sk=$(c 'EMPTY-TURN-STEER-SKIP'); e_fa=$(c 'EMPTY-TURN-STEER-FAIL')

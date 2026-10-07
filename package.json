@@ -22,6 +22,14 @@
     "ftllm"
   ],
   "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.1.5-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    }
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

@@ -41,7 +41,7 @@
  *   ⚠️ 关键设计取舍：判定放在 **`turn/end`**（一个 turn 有多个 step，中途"暂无正文"是正常的，
  *   必须等 turn 收口才能断言）；**默认动作为 `log`（只记日志 + 落结构样本，不上膛）** ——
  *   `steer`（自动补一句"你没有输出正文，请直接给结论"）属于**替机主自动发消息**，是行为改变，
- *   由机主一行配置决定是否上膛（`emptyTurnAction: 'steer'`）。
+ *   **发布包默认 `log`**、由使用者一行配置决定是否上膛（`emptyTurnAction: 'steer'`）。
  *
  * ── v0.4.0 为什么推倒重来（2026-10-01 实录，详见知识库
  *    `05-issues/open/loop-fuse-kills-long-tasks.md`）────────────────────
@@ -184,6 +184,11 @@ export const DEFAULTS = {
   p1bSuccessDropPct: 50,     // **预注册成功阈值**：k24 降到 ≤ 注入前的 50% **且** ① 线不再命中
   p1bHint: '⚠️ 系统提示（dsh-local-loop-fuse）：检测到你在**原地重复**。请**停止推理，直接输出结论**，'
     + '或直接调用你要调用的工具。不要继续复述同一串词。',
+  // ⚠️ **每会话注入上限**（v0.8.2 加 · 拾遗第 3 轮 §3 实测）：`attempt` = 一次模型请求 = **一个 step**
+  //   ⇒ 光靠 attempt 内的 `p1bDone` 挡不住跨 step 的循环：实测一个会话注入 **6 次**，且每条都
+  //   **永久进 durable transcript**（`dsh-agent-loop:1028`）。姊妹插件 `loop-restart-exp` 的教训：
+  //   「**steer 没有平台级限次保护**，无条件重启 = 自造死循环」。
+  p1bSteerMaxPerSession: 2,
   textStrikesBeforeCancel: 2, // ① 线：**命中达此次数才掐断**（2026-09-30 新增；此前首次命中即掐）
   checkEvery: 200,   // 每新增这么多字符检查一次
   signalMaxAgeMinutes: 10, // 保存的 AbortSignal 超过此时长视为陈旧 ⇒ 不 abort（防御性，见 v0.3.3）
@@ -245,12 +250,13 @@ export const DEFAULTS = {
   emptyTurnLimit: 1,         // 同一会话**连续** N 个零正文 turn 才触发（中间有正常 turn 即归零）。
                              //   默认 1 = 第一次零正文就记/补救 —— 因为它对用户就是"什么都没看到"；
                              //   想更保守就调 2（代价：第一轮仍然白等）。
-  emptyTurnAction: 'steer',  // 'log' = 只记日志 + 落结构样本；'steer' = **另自动补一句"你没输出正文"提示**
-                             // 🔴 2026-10-07 机主定**上膛**（原默认 'log'）—— 依据：
-                             //   ① 事故当时 ⑤ 线**已经看到了 3 次**（turn 310/311/313）却只 `log`，
-                             //      缺的是**动作**而不是检测；② 拾遗**独立**得出同一结论（她 reasoning.log:992）。
-                             // 限次保护：`emptyTurnSteerMax`（**每会话 3 次**，防"补救本身变成新循环"）。
-                             // 'steer' = 另外自动给 agent 补一句「你没输出正文，请直接给结论」
+  emptyTurnAction: 'log',    // 'log' = 只记日志 + 落结构样本；'steer' = **另自动补一句"你没输出正文"提示**
+                             // 🔴 2026-10-07 机主定**本机**上膛（依据：事故当时 ⑤ 线已看到 3 次却只 `log`，
+                             //   缺的是**动作**不是检测；拾遗独立得出同一结论）。
+                             // ⚠️ 但**发布包默认 `'log'`**（v0.8.2 收口）：本项与 ①c 一样属于
+                             //   「**替使用者自动发消息**，且会写进 durable transcript」⇒ 按同一条原则保守默认；
+                             //   本机由 `profiles/web/cordis.patch.yml` 显式钉 `'steer'`（行为不变）。
+                             // 限次：`emptyTurnSteerMax`（**每会话 3 次**，防"补救本身变成新循环"）。
   emptyTurnSteerMax: 3,      // action='steer' 时，**每会话**最多补救几次（防"补救本身变成新循环"）
   emptyTurnHint: '⚠️ 系统提示（dsh-local-loop-fuse）：你上一轮**只产出了思考、正文一个字都没有**，'
     + '用户看不到任何内容。请**直接输出结论**，不要再展开推理。',
@@ -435,7 +441,7 @@ function deepFreeze(value) {
  *
  * @returns {Promise<{ via: 'dsh-llm'|'self-built', message: object }>}
  */
-async function buildSteerMessage(text, plugin = 'dsh-local-loop-fuse') {
+export async function buildSteerMessage(text, plugin = 'dsh-local-loop-fuse') {
   try {
     const { createUserMessage } = await import('@deepseek-ai/dsh-llm');
     return {
@@ -884,6 +890,40 @@ export const apply = (ctx, config) => {
     return resolved;   // ← 必须原样透传下游结果
   });
 
+  // ── ①c P1-b 的观测状态（v0.8.2 重构：**session/turn 级**，不再是 attempt 级）──────
+  // ⚠️ 为什么必须搬到 session 级（拾遗第 3 轮实测，归档 `07-experiments/2026-10-07-p1b-inject-round1.md` §2.1）：
+  //   `attemptId` = **一次模型请求 = 一个 step**，而 `steer` 要到**下一个 step 边界**才被 claim 进 prompt
+  //   （`dsh-agent-loop:889` 的 preStep / 类型声明 `runtime-types.d.ts:195` 原话 "next step boundary"）
+  //   ⇒ **同一 attempt 内、注入点之后的每个字符都是"注入还没进 prompt"时生成的**，
+  //     拿它们当读数 = 测注入**不可能影响**的文本。实测两种坏结局：
+  //     A) 同一 attempt 继续吐 ⇒ `verdict=无效` 是**结构性必然**（不是测量结果）；
+  //     B) 本 step 很快 end、跨 step 继续循环 ⇒ 旧实现**连一行都不留**（`steer=6 / OBSERVE=0`）；
+  //     而"注入成功"的样本**更容易**落进 B（模型收尾快 ⇒ 攒不满 N）⇒ 样本系统性偏向"无效"。
+  //   ⇒ 现在：**注入之后新出现的 attempt** 才开始累计；本 attempt 的剩余输出只记 `blindChars`；
+  //     turn 结束仍未满 N ⇒ **补一行** `verdict=观察中断`（否则统计分母只包含"没救回来的那些"）。
+  /** @type {Map<string, {injectAttempt:string, k24Before:number, until:number, acc:string, blindChars:number, injected:boolean, atChars:number}>} */
+  const p1bPending = new Map();
+  /** 每会话已注入次数（**上限**见 `p1bSteerMaxPerSession`） @type {Map<string, number>} */
+  const p1bSteeredBySession = new Map();
+
+  /** 出观测结论（正常观察满 N / turn 结束中断，两种都走这里 ⇒ 分母完整） */
+  const emitP1bObserve = (p, agentRef, sid, interrupted = false) => {
+    try {
+      const k24After = k24Max(p.acc.slice(-cfg.p1bObserveChars));
+      // ⚠️ 读数 2 的口径 = **注入之后新 attempt 的累计文本**（不是整个 buf、也不是本 attempt 的尾巴）
+      const still = p.acc.length >= cfg.minChars ? isLooping(p.acc, cfg) : null; // null = 观察量不足
+      const drop = p.k24Before > 0 ? Math.round((1 - k24After / p.k24Before) * 100) : 0;
+      const ok = !interrupted && p.injected === true && p.k24Before > 0
+        && k24After <= p.k24Before * (1 - cfg.p1bSuccessDropPct / 100) && still === false;
+      const verdict = interrupted ? '观察中断' : (ok ? '有效' : (still === true ? '无效' : '不确定'));
+      note(`P1B-OBSERVE session=${sid ?? '?'} attempt=${p.injectAttempt} N=${cfg.p1bObserveChars} `
+         + `segLen=${p.acc.length} blindChars=${p.blindChars} k24Before=${p.k24Before} k24After=${k24After} `
+         + `drop=${drop}% line1StillHits=${still} injected=${p.injected} verdict=${verdict} `
+         + `—— ⚠️ 基础率 2/6 ⇒ 单次只作记录、不作结论`);
+    } catch { /* 观测绝不影响会话事件链 */ }
+    void agentRef;
+  };
+
   // ── ② 流式输出：累计 reasoning/text 增量并做宽松重复检测（v0.1）──────
   ctx.on('agent/assistant-stream', (payload) => {
     const { agent, frame } = payload ?? {};
@@ -910,26 +950,19 @@ export const apply = (ctx, config) => {
     if (c.text) st.buf += c.text;
     st.kind = c.type;
 
-    // ── ①c P1-b 观测：注入后累计到 N 字符 ⇒ 出结论（**双读数**，烛微 round6 §2.1 要求）──
-    // 读数 1 = k24（结构量，不数"停"字 ⇒ 避开注入文本自身的度量污染）
-    // 读数 2 = isLooping（**独立**：注入后 ① 线是否仍命中）
-    // 预注册判据：k24 降到 ≤ (1-dropPct) **且** ① 线不再命中 ⇒ 有效；仍命中 ⇒ 无效；其余 ⇒ 不确定
-    if (st.p1b && st.buf.length >= st.p1b.until) {
-      const p = st.p1b; st.p1b = null;
-      const k24After = k24Max(st.buf.slice(-cfg.p1bObserveChars));
-      // ⚠️ **读数 2 的口径 = 注入之后新增的那一段**（不是整个 buf）—— 2026-10-07 写 `test-p1b.mjs`
-      //   时发现：① 线（尤其滑窗支）判的是**全文**，而注入点之前那段循环**永久留在 `buf` 里**
-      //   ⇒ 用整个 `buf` 作读数 ⇒ `line1StillHits` **恒为 true** ⇒ verdict 永远"无效"，观测等于白做。
-      //   现在只问一件事：「**注入之后这一段**还在循环吗」。
-      const seg = st.buf.slice(p.at);
-      const still = seg.length >= cfg.minChars ? isLooping(seg, cfg) : null; // null = 观察量不足 ⇒ 不确定
-      const drop = p.k24Before > 0 ? Math.round((1 - k24After / p.k24Before) * 100) : 0;
-      const ok = p.k24Before > 0
-        && k24After <= p.k24Before * (1 - cfg.p1bSuccessDropPct / 100) && still === false;
-      note(`P1B-OBSERVE session=${agent?.session?.id ?? '?'} turn=${turnOfAttempt(frame.attemptId) ?? '?'} `
-         + `N=${cfg.p1bObserveChars} segLen=${seg.length} k24Before=${p.k24Before} k24After=${k24After} drop=${drop}% `
-         + `line1StillHits=${still} injected=${p.injected} verdict=${ok ? '有效' : (still === true ? '无效' : '不确定')} `
-         + `—— ⚠️ 基础率 2/6 ⇒ 单次只作记录、不作结论`);
+    // ①c 观测累计（**session 级**）：本 attempt 的剩余输出只记 `blindChars`，
+    //   注入之后**新 attempt** 的文本才进读数（`pend.acc`）。
+    const sidOfFrame = agent?.session?.id ?? agent?.session?.header?.id;
+    {
+      const pend = sidOfFrame ? p1bPending.get(sidOfFrame) : null;
+      if (pend && c.text) {
+        if (frame.attemptId === pend.injectAttempt) pend.blindChars += c.text.length;
+        else pend.acc += c.text;
+        if (pend.acc.length >= pend.until) {
+          p1bPending.delete(sidOfFrame);
+          emitP1bObserve(pend, agent, sidOfFrame);
+        }
+      }
     }
 
     if (st.buf.length >= st.nextCheck) {
@@ -942,37 +975,55 @@ export const apply = (ctx, config) => {
         const rec = signals.get(agent);
         const sig = rec?.signal;
         const stale = !rec || (Date.now() - rec.at > cfg.signalMaxAgeMinutes * 60000);
-        // ── ①c P1-b：首次命中时注入「停止」类词（**带预注册观测**；见 DEFAULTS 里的长注释）──
-        // ⚠️ 与 ⑤ 线**共用 `agent.steer`**（同一 API、另一个触发条件）；**每 attempt 只注入一次**。
+        // ── ①c P1-b：命中时注入「停止」类词（**带预注册观测**；见 DEFAULTS 里的长注释）──
+        // ⚠️ 与 ⑤ 线**共用 `agent.steer`**（同一 API、另一个触发条件）。
         // ⚠️ 本动作**替机主自动发消息** ⇒ 失败/拿不到能力时必须留痕（SKIP/FAIL），不许静默。
-        // ⚠️ `p1bDone`：**每 attempt 最多尝试注入一次**。观测窗口结束会把 `st.p1b` 置回 `null`，
-        //   只靠 `!st.p1b` 判断 ⇒ 命中持续时**会二次、三次注入**（2026-10-07 写 `test-p1b.mjs`
-        //   时发现：原文注释写着"每 attempt 只注入一次"，但代码做不到）。
-        //   SKIP/FAIL 也算"尝试过" ⇒ 不重试、不刷日志。
-        if (cfg.p1bEnabled !== false && !st.p1b && !st.p1bDone && st.hits >= (cfg.p1bInjectAtHit ?? 1)) {
+        // ⚠️ **两道限次，各管一层**（别把它们混为一谈）：
+        //   · `p1bDone`（attempt 内）—— 同一 attempt 不重复尝试；
+        //   · `p1bSteerMaxPerSession`（会话内）—— **这才是安全属性**：`attempt` = 一次模型请求 = **一个 step**
+        //     ⇒ 只靠前者挡不住跨 step 的循环。拾遗第 3 轮实测：一个会话注入 **6 次**，而且每条都会
+        //     **永久写进 durable transcript**（`dsh-agent-loop:1028 session.append`）——
+        //     那不是"发一句话"，是往会话存档里钉 N 条。
+        //     姊妹插件 `tools/loop-restart-exp` 的原话：「steer 没有平台级限次保护，无条件重启 = 自造死循环」。
+        if (cfg.p1bEnabled !== false && !st.p1bDone && st.hits >= (cfg.p1bInjectAtHit ?? 1)) {
           st.p1bDone = true;
+          const steerMax = Math.max(1, cfg.p1bSteerMaxPerSession ?? 2);
+          const steerUsed = sid ? (p1bSteeredBySession.get(sid) ?? 0) : 0;
+          if (sid && steerUsed >= steerMax) {
+            note(`P1B-INJECT-QUOTA session=${sid} attempt=${frame.attemptId} —— 本会话已注入 `
+               + `${steerUsed}/${steerMax} 次，跳过（上限见 p1bSteerMaxPerSession）`);
+          } else {
           const win = Math.min(st.buf.length, cfg.p1bObserveChars);
-          st.p1b = {
-            at: st.buf.length,
-            until: st.buf.length + cfg.p1bObserveChars,
+          const p = {
+            injectAttempt: frame.attemptId,
+            atChars: st.buf.length,
+            until: cfg.p1bObserveChars,
             k24Before: k24Max(st.buf.slice(-win)),
+            acc: '',
+            blindChars: 0,
             injected: false,
           };
-          const p = st.p1b;
           const hitAt = st.hits;
           if (agent && typeof agent.steer === 'function') {
             // ⚠️ 动态 import ⇒ 不能阻塞流式事件链；**成败都留痕**（本项替使用者发消息，不许静默）
             steerHint(agent, cfg.p1bHint, name).then((via) => {
               p.injected = true;
-              note(`P1B-INJECT session=${sid ?? '?'} turn=${turn ?? '?'} hit=${hitAt} via=${via} `
-                 + `atChar=${p.at} k24Before=${p.k24Before} observeN=${cfg.p1bObserveChars} `
-                 + `dropPct=${cfg.p1bSuccessDropPct} —— 预注册参数已打印；`
+              // ✅ 观测只在**注入成功之后**才开始（拾遗 §2.2：SKIP/FAIL 若也出 verdict，
+              //    有效率的分母就被"根本没注入"的样本污染）
+              if (sid) {
+                p1bPending.set(sid, p);
+                p1bSteeredBySession.set(sid, steerUsed + 1);
+              }
+              note(`P1B-INJECT session=${sid ?? '?'} attempt=${frame.attemptId} hit=${hitAt} via=${via} `
+                 + `atChars=${p.atChars} k24Before=${p.k24Before} observeN=${cfg.p1bObserveChars} `
+                 + `dropPct=${cfg.p1bSuccessDropPct} quota=${steerUsed + 1}/${steerMax} —— 预注册参数已打印；`
                  + `⚠️ 基础率 2/6（本簇 6 段真循环有 2 段自愈）⇒ 单次结果只作记录、不作证据`);
             }).catch((e) => {
-              note(`P1B-INJECT-FAIL session=${sid ?? '?'} turn=${turn ?? '?'} ${String(e).slice(0, 160)}`);
+              note(`P1B-INJECT-FAIL session=${sid ?? '?'} attempt=${frame.attemptId} ${String(e).slice(0, 160)}`);
             });
           } else {
-            note(`P1B-INJECT-SKIP session=${sid ?? '?'} turn=${turn ?? '?'} —— agent 无 steer（拿不到能力）`);
+            note(`P1B-INJECT-SKIP session=${sid ?? '?'} attempt=${frame.attemptId} —— agent 无 steer（拿不到能力）`);
+          }
           }
         }
         // v0.3.3 节流：同一 attempt 命中多次只记 1、6、11… 次（原实现一次命中写一行，
@@ -1071,7 +1122,8 @@ export const apply = (ctx, config) => {
    * ⑤线动作。**只在 `turn/end` 调用**（此时该 turn 的正文已成定局）。
    * 默认 `emptyTurnAction:'log'` ⇒ 只写日志 + 落**结构样本**（样本里**不含思考正文**）。
    * 上膛（`'steer'`）= 自动给 agent 补一句「你没有输出正文」—— 属于**替机主自动发消息**，
-   *   所以默认关闭；且受 `emptyTurnSteerMax`（每会话上限）约束。
+   *   所以**发布包默认关闭**（本机由 `profiles/web/cordis.patch.yml` 显式钉 `'steer'`）；
+   *   且受 `emptyTurnSteerMax`（每会话上限）约束。
    */
   const evaluateEmptyTurn = (sid, st) => {
     try {
@@ -1159,6 +1211,14 @@ export const apply = (ctx, config) => {
         // ── v0.8.0 ⑤线：**turn 收口才判**「零正文」（多 step 的 turn 中途无正文是正常的）──
         const stEnd = turns.get(`${sid}#${d.turn}`);
         if (stEnd && cfg.emptyTurnDetect !== false) evaluateEmptyTurn(sid, stEnd);
+        // ── ①c P1-b：turn 收口 ⇒ 观测窗口关闭。**未满 N 也必须留一行**（拾遗第 3 轮 §2.1 第 4 点）：
+        //   否则"注入后模型很快收尾"的成功样本会**静默消失**，统计分母只剩"没救回来的那些"
+        //   ⇒ 效果层的率会被系统性拉成"无效"。
+        const pendEnd = p1bPending.get(sid);
+        if (pendEnd) {
+          p1bPending.delete(sid);
+          emitP1bObserve(pendEnd, agentsBySession.get(sid), sid, true);
+        }
         turns.delete(`${sid}#${d.turn}`);
         killed.delete(`${sid}#${d.turn}`);   // 2026-10-03：turn 结束即清（条目已无用，防 Set 无限增长）
         return;

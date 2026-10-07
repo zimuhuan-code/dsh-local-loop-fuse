@@ -166,6 +166,7 @@ grep -n "loop-fuse" <DSH_HOME>/profiles/web/package.json
 | `p1bInjectAtHit` | `1` | **预注册**：第几次 ① 线命中后注入（1 = 首次命中即注入）|
 | `p1bObserveChars` | `2000` | **预注册 N**：注入后再观察多少字符才出观测结论 |
 | `p1bSuccessDropPct` | `50` | **预注册成功阈值**：`k24` 降到 ≤ 注入前的 50% **且** ① 线不再命中 ⇒ 判"有效" |
+| `p1bSteerMaxPerSession` | `2` | **每会话注入上限**（🔴 安全属性，别删）：`attempt` = 一个 step ⇒ 光靠 attempt 内的去重挡不住跨 step 循环（实测一会话 6 条，且每条**永久进会话存档**）|
 | `p1bHint` | （见 `DEFAULTS`）| 注入的提示文本（⚠️ 会作为**用户消息**进入会话，等同替使用者发话）|
 | `checkEvery` | `200` | 每新增这么多字符检查一次 |
 | `abortViaCancel` | `true` | **① 线真掐断的主路径**：调 `agent.cancel({kind:'hook',reason})`（v0.3.3 新增，见下节「为什么不能 `signal.abort()`」）|
@@ -181,7 +182,7 @@ grep -n "loop-fuse" <DSH_HOME>/profiles/web/package.json
 | `repeatCallExemptTools` | `job_output, job_list` | **合法轮询豁免**：等后台任务时本就会连调同参 |
 | `emptyTurnDetect` | `true` | **⑤ 线总开关**：整个 turn 只有思考、正文一个字都没有 ⇒ 检出（判别式只看**结构**，不落思考正文）|
 | `emptyTurnLimit` | `1` | 同一会话**连续** N 个零正文 turn 才触发（中间有正常 turn 即归零）|
-| `emptyTurnAction` | `'steer'` | `'log'` = 只记日志 + 落结构样本；**`'steer'` = 另自动补一句「你没输出正文」提示**（2026-10-07 上膛）|
+| `emptyTurnAction` | `'log'`（作者本机显式 `'steer'`）| `'log'` = 只记日志 + 落结构样本；`'steer'` = **另自动补一句「你没输出正文」提示**。⚠️ 与 ①c 同一条原则：**替使用者发消息的动作，发布包默认关闭** |
 | `emptyTurnSteerMax` | `3` | `action='steer'` 时**每会话**最多补救几次（防"补救本身变成新循环"）|
 | `emptyTurnHint` | （见 `DEFAULTS`）| ⑤ 线注入的提示文本 |
 | `watchIntervalSec` | `60` | 行动层定时扫描间隔（秒） |
@@ -451,7 +452,7 @@ node test-abort.mjs        # 12/12 · 集成：① 线"检测 ⇒ 真 cancel"（
 node test-cancel.mjs       # 14/14 · 集成：③ 线 strike ⇒ cancel（约 35 s）
 node test-dump.mjs         # 42/42 · v0.6.0 ④线：脱敏 / 取证切片 / 三条线落盘 / 去重 / 禁名单守卫 / 上限（约 8 s）
 node test-empty-turn.mjs   # 19/19 · v0.8.0 ⑤线：零正文判据 + 上膛路径（约 1 s）
-node test-p1b.mjs          # 16/16 · v0.8.2 ①c：注入 / 预注册观测 / 能力自检 / 只注入一次（约 3 s）
+node test-p1b.mjs          # 20/20 · v0.8.2 ①c：注入 / 跨 attempt 观测 / 每会话上限 / 能力自检 / 消息 invariant（约 3 s）
 ```
 
 ⚠️ **写集成测试时务必 `dumpSamples: false`**（或把 `dumpDir` 指到临时目录）——
@@ -478,10 +479,11 @@ node test-p1b.mjs          # 16/16 · v0.8.2 ①c：注入 / 预注册观测 / �
 ## 状态与后续
 
 - **v0.8.2（2026-10-07 · 待发布）**：①b 末窗支 + ①b-2 滑窗支（尾部补偿）+ ①c P1-b 注入与观测 +
-  能力自检 + 三个测试抓到的 bug（见上）。**测试 131 项全绿**
-  （islooping 28 · abort 12 · cancel 14 · dump 42 · empty-turn 19 · p1b 16 · `samples/` 未污染）。
+  能力自检 + **四个测试抓到的 bug + 独立审阅推翻的两条设计**（见上）。**测试 135 项全绿**
+  （islooping 28 · abort 12 · cancel 14 · dump 42 · empty-turn 19 · **p1b 20** · `samples/` 未污染）。
   ⚠️ **重启 dsh 后必核三行**：`STEER-RESOLVE …` → `P1B-CAPABILITY …` → 真命中时的 `P1B-INJECT … via=…`；
-  其中**自建兜底（`via=self-built`）能否被 dsh 正常消费仍是【待验证】**。
+  其中**自建兜底（`via=self-built`）已被独立审阅端到端验证**（append → deriveMessages → durable 回放全通、
+  与官方构造器逐字段等价 ⇒ 见 `07-experiments/2026-10-07-p1b-inject-round1.md` §1）。
 - **v0.3.3（2026-09-29 夜）**：① 线"检测有效但掐不死"的**两层 bug 已修 + 有回归测试**
   （`test-abort.mjs` 12/12）；**① 线已上膛 `dryRun=false`** —— **重启 dsh 后生效**。
 - 生效判据：`loaded … dryRun=false … abortViaCancel=true cancelKeepInbox=true`。
@@ -563,7 +565,7 @@ empty-turn 19/19，`samples/` 未被污染）。新增 ⑦/⑦b 两条**合成**
 
 | 配置 | 原 | 新 | 依据 / 边界 |
 |---|---|---|---|
-| `emptyTurnAction` | `'log'` | **`'steer'`** | 事故当时 ⑤ 线**已经看到 3 次**（turn 310/311/313）却只 `log` ⇒ **缺的是动作、不是检测**；拾遗**独立**得出同一结论（`reasoning.log:992`）。限次：`emptyTurnSteerMax: 3` / 会话 |
+| `emptyTurnAction` | `'log'` | **`'steer'`**（当轮定调）| 事故当时 ⑤ 线**已经看到 3 次**（turn 310/311/313）却只 `log` ⇒ **缺的是动作、不是检测**；拾遗**独立**得出同一结论（`reasoning.log:992`）。限次：`emptyTurnSteerMax: 3` / 会话。<br>⚠️ **v0.8.2 收口时又改回包默认 `'log'`**（与 ①c 同一条「替使用者发消息 ⇒ 保守默认」原则），**本机由 profile patch 钉 `'steer'`** ⇒ 本机行为不变 |
 | `lowDivMaxUniq` | `40` | **`45`** | 拾遗在 **159 会话**样本上测：`45` = 10/10 召回 · 0 误报。⚠️ 白露在 **160 会话 / 5,013 块**上复测：45 与 40 结果**相同**（都召回 3/5，漏 `14856`/`14872`）；且"误报"里混着**未标注的真循环**（`aed7127e` 的 do-it 循环）⇒ **该数字待"真循环标注集"建好后重验**。机主定"先用 45、慢慢调整" |
 
 ⚠️ **三条重要边界**
@@ -620,8 +622,13 @@ empty-turn 19/19，`samples/` 未被污染）。
 | **基础率对照** | 日志与统计脚本都写明**基础自愈率 2/6 ≈ 33%** | 单次"注入后它停了"不算证据 |
 
 **观测判据**（`P1B-OBSERVE`）：`k24` 降到 ≤ `(1-dropPct)` **且** 读数 2 为"不再循环" ⇒ `有效`；
-**仍循环** ⇒ `无效`；其余（含观察量不足）⇒ `不确定`。每行都带基础率提醒。
-⚠️ **读数 2 的口径 = 注入之后新增的那一段**（不是整个缓冲区）—— 见下面「测试抓到的三个 bug」。
+**仍循环** ⇒ `无效`；其余 ⇒ `不确定`；**turn 结束仍未攒满 N ⇒ `观察中断`**（也必须留一行）。每行都带基础率提醒。
+⚠️ **读数 2 的口径 = 「注入之后、新 attempt 的累计文本」**（两项都踩过坑）：
+- **不是整个缓冲区**：注入点之前那段循环**永久留在缓冲区**里 ⇒ `line1StillHits` 恒真；
+- **也不是注入所在 attempt 的尾巴**：`attempt` = 一次模型请求 = 一个 **step**，而 `steer` 要到
+  **下一个 step 边界**才进 prompt ⇒ 同 attempt 内的文本是注入**不可能影响**的
+  （那部分只计入 `blindChars`，不进读数）。
+两处都是实测推翻后才改的，见文末「测试抓到的四个 bug + 审阅推翻的两条」。
 
 **能力自检**（`P1B-CAPABILITY`）：注入依赖 `agent.steer`，而它"能不能用"原先**只能等一次真循环**
 才知道（当天是 0 次触发 ⇒ 等于没法验证）。现在**任何一次 LLM 请求**时就地探测、每会话只打一行：
@@ -633,19 +640,27 @@ empty-turn 19/19，`samples/` 未被污染）。
 > `1/2 = 50%` 与一条假 🚩。这正是本仓库反复出现的那族毛病：**判据比被检查的东西宽**。
 
 **注入通路本身也有坑（v0.8.2 写测试时抓到）**：`agent.steer()` 要一条 **UserMessage**，
-官方构造器 `createUserMessage` 在 **dsh 内部包** `@deepseek-ai/dsh-llm` 里 ——
-而 `link:` 装的插件**在解析路径上够不着它**（实测 `ERR_MODULE_NOT_FOUND`）。
+官方构造器 `createUserMessage` 在 **dsh 内部包** `@deepseek-ai/dsh-llm` 里，而**本包零依赖**
+（`index.js` 只 import `node:path` / `node:fs`，五个候选 `node_modules` 目录全不存在）
+⇒ 解析**必然失败**（`ERR_MODULE_NOT_FOUND`；注意：**不是** `link:` 的锅，任何零依赖插件都一样）。
 ⇒ 现在按优先级两条路（`buildSteerMessage()`），日志用 `via=` 区分：
-`via=dsh-llm`（官方构造器）· `via=self-built`（**自建兜底**：`{id, role, content, source}` + 深冻结）。
-⚠️ 自建兜底能否被 dsh 正常消费 = **【待验证】**（需重启 dsh 后在真实会话里看语义是否正常）。
+`via=dsh-llm`（官方构造器，装了 `peerDependencies` 的环境会走这条）·
+`via=self-built`（**自建兜底**：`{id, role, content, source}` + 深冻结）。
+✅ **自建消息已被独立审阅端到端验证可用**：真 dsh 的 `Session.append` → `deriveMessages` →
+**durable 回放**全通，与官方构造器**逐字段 `deepEqual`**、四层均 frozen、回放侧四条 invariant 全过
+（`07-experiments/2026-10-07-p1b-inject-round1.md` §1，探针 `.review-scratch/probe{2,3}.mjs`）。
+⚠️ 形状错了**不会当场炸**（live append 不校验），要到**回放会话存档**才抛 ⇒ 测试 ⑮ 固化那四条 invariant。
 
 **把概率统计出来**（`p1b-stats.sh`，仓库根 · **不在 npm 包里**）：
 ```bash
 bash p1b-stats.sh                      # 默认读 ${DSH_HOME}/logs/dsh-local-loop-fuse/loop-fuse.log
+# ⚠️ 该路径是**可移植兜底**：很多实例用 cordis.patch.yml 把 logPath 钉到别处 ⇒ 找不到时
+#    脚本会打印「去哪儿找」的可执行提示（不会闷声失败）
 bash p1b-stats.sh /path/to/loop-fuse.log
 ```
-分两段、**顺序不能颠倒**：① **能力层**（`CAPABILITY` / `INJECT` 成功 vs SKIP/FAIL）→
-② **效果层**（`OBSERVE` 的 verdict 分布）。`n<5` 一律标「不足以下结论」。
+分两段、**顺序不能颠倒**：① **能力层**（`CAPABILITY` / `INJECT` 成功 vs SKIP/FAIL，外加
+`STEER-RESOLVE` 那关）→ ② **效果层**（`OBSERVE` 的 verdict 分布，**只统计 `injected=true`**，
+并把 `观察中断` 与 `INJECT-QUOTA` 单列）。`n<5` 一律标「不足以下结论」。
 
 **发布默认值**：`p1bEnabled` **默认 `false`** —— 本项会**替使用者自动发消息**
 （以用户身份注入一句话），与 0.8.1 的 `probeMount` 同一套做法：**默认可移植/保守 + 本机覆盖**。
@@ -654,15 +669,25 @@ bash p1b-stats.sh /path/to/loop-fuse.log
 **生效方式**：`link:` + ESM 缓存 ⇒ 改完**必须重启 dsh**；重启后核对三行：
 `STEER-RESOLVE …`（解析成败）· `P1B-CAPABILITY …`（能力在不在）· 真命中时的 `P1B-INJECT … via=…`。
 
-### 🐞 v0.8.2 测试抓到的三个 bug（都是"不写测试就看不见"的那类）
+### 🐞 v0.8.2：测试抓到的四个 bug + 审阅推翻的两条设计
 
-`test-p1b.mjs`（16/16）是本节的防线。写它的过程中当场抓到三个缺陷，都已修：
+`test-p1b.mjs`（**20/20**）是本节的防线。
+
+**A. 写测试时当场抓到的四个缺陷**（都已修）：
 
 | # | 缺陷 | 为什么危险 | 修法 |
 |---|---|---|---|
-| 1 | **`createUserMessage` 从未 import** | ①c 每次注入都 `ReferenceError` ⇒ **P1-b 上线即失效**（能力自检却显示"steer 可用"） | 抽 `buildSteerMessage()` 统一构造（含自建兜底），两条注入路径共用 |
-| 2 | **观测读数 2 口径过宽** | 用**整个缓冲区**调 `isLooping`，而注入点之前那段循环**永久留在缓冲区里** ⇒ `line1StillHits` **恒为 true** ⇒ verdict 永远"无效"，观测等于白做 | 只对**注入点之后**的片段判定（`buf.slice(p.at)`）|
-| 3 | **会二次注入** | 观测结束把 `st.p1b` 置回 `null`，命中持续时条件又成立 ⇒ 同一 attempt **反复注入**（注释写着"只注入一次"，代码做不到）| 加持久标记 `p1bDone`：**每 attempt 最多尝试注入一次**（SKIP/FAIL 也算尝试过）|
+| 1 | **`createUserMessage` 从未 import** | 每次注入都 `ReferenceError`（`P1B-INJECT-FAIL`）⇒ 能力自检却显示"steer 可用"，**看着是好的**。⚠️ 分级：这是**代码阅读可得**的缺陷；**生产日志里 `P1B-INJECT*` = 0 行 ⇒ 从未触发过**（独立审阅纠正了我"上线即失效"的措辞）| 抽 `buildSteerMessage()` 统一构造（含自建兜底），两条注入路径共用 |
+| 2 | **内部包解析不到** | 零依赖插件 import `@deepseek-ai/dsh-llm` 必然失败 ⇒ 即使修好 #1 也注入不了 | 自建 UserMessage 兜底（已被审阅端到端验证）+ 可选 `peerDependencies` |
+| 3 | **观测读数 2 口径过宽** | 用**整个缓冲区**调 `isLooping` ⇒ 注入点之前那段循环永久在缓冲里 ⇒ `line1StillHits` **恒真** ⇒ verdict 永远"无效" | 只对**注入点之后、新 attempt** 的累计文本判定 |
+| 4 | **会二次注入** | 观测结束把状态置回 `null`，命中持续时条件又成立 ⇒ 同一 attempt 反复注入 | 加 `p1bDone`（attempt 内去重）|
+
+**B. 独立审阅（拾遗第 3 轮 · `07-experiments/2026-10-07-p1b-inject-round1.md`）推翻的两条设计**：
+
+| # | 原设计 | 为什么错（她的实测） | 改法 |
+|---|---|---|---|
+| 5 | 观测窗口**只在同一 attempt 内** | `attempt` = 一次模型请求 = 一个 step，而 `steer` 到**下一个 step** 才进 prompt ⇒ 读数覆盖的是**注入不可能影响**的文本；跨 step 时更糟：**连一行都不留**（实测 `steer=6 / OBSERVE=0`），而"注入成功"的样本更容易落进这种情形 ⇒ 效果率被系统性拉向"无效" | 观测搬到 **session/turn 级**：注入后**新 attempt** 才累计，本 attempt 尾巴记 `blindChars`，turn 结束未满 N ⇒ 补 `verdict=观察中断` |
+| 6 | 注入**没有次数上限** | `attempt` 级去重挡不住跨 step 循环 ⇒ 实测一个会话注入 **6 条**，且每条都**永久写进 durable transcript** | 加 `p1bSteerMaxPerSession`（默认 2）+ `P1B-INJECT-QUOTA` 日志 |
 
 📌 ⑦ 用例还固化了一条容易被忽略的事实：**① 线的精确子串判据不接受重叠命中** ⇒
 周期文本要长到"末尾窗口里有 ≥2 个不重叠接缝"才判得出来（实测量级 ~4.6k 字符）。
