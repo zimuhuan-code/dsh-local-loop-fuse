@@ -82,7 +82,7 @@ t('⑦ 带噪声的交替空转（该触发）', noisy, true);
 // ⚠️ 本样本是**合成的、不含任何真实对话原文**（仓库是 public）。
 const mkLocalLoop = () => {
   const normal = Array.from({ length: 60 },
-    (_, i) => `第 ${i} 步：核对 /mnt/models/x${i}.json 的第 ${i * 7} 行，确认参数与预期一致。`).join('\n');
+    (_, i) => `第 ${i} 步：核对 /srv/data/x${i}.json 的第 ${i * 7} 行，确认参数与预期一致。`).join('\n');
   const frags = ['（停）', '（调用）', '（结束）', '（执行）', '（现在）'];
   let loop = '';
   for (let i = 0; i < 200; i++) {
