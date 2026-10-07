@@ -61,6 +61,10 @@ const mk = (over = {}) => {
   return ctx;
 };
 const readLog = () => { try { return fs.readFileSync(LOG, 'utf8'); } catch { return ''; } };
+/** 读**切断专账**（`CANCEL source=…` 行只写这里，不写主日志 —— 2026-10-07 实测踩到） */
+const readCancelLog = () => {
+  try { return fs.readFileSync(`${tmpdir()}/loop-fuse-p1b-cancels-test.log`, 'utf8'); } catch { return ''; }
+};
 const count = (log, re) => (log.match(re) ?? []).length;
 
 /** 一段**周期文本**（整体重复才构成循环；单段内部无 24-gram 重复） */
@@ -377,6 +381,20 @@ function hitOnce(ctx, agent, attemptId) {
   t('㉔ 默认 log ⇒ 有 QUOTA 但**没有** QUOTA-CANCEL（发布包保守）',
     /P1B-INJECT-QUOTA session=s-quotalog/.test(log) && !/P1B-QUOTA-CANCEL session=s-quotalog/.test(log),
     `cancel=${calls.cancel.length}`);
+}
+
+// ── ㉕ §G：真 turn 的回归防线（专账里的 turn 必须是真 turn，不是 attempt 尾号）──
+{
+  const ctx = mk({ dryRun: false, textStrikesBeforeCancel: 1 });   // 首次命中即掐，便于取专账
+  const { agent, calls } = mkAgent('s-realturn');
+  await Promise.all(ctx.fire('agent/request',
+    { agent, turn: 7, signal: new AbortController().signal }, async () => ({})));   // 真 turn = 7
+  hitOnce(ctx, agent, 'a1');
+  await sleep(500);
+  const cl = readCancelLog();
+  t('㉕ §G 专账里 CANCEL 的 turn = 真 turn(7)，不是 attempt 尾号',
+    /CANCEL source=text-loop session=s-realturn turn=7/.test(cl) && calls.cancel.length === 1,
+    cl.match(/CANCEL source=text-loop[^\n]*/)?.[0]?.slice(0, 110) ?? '(无专账)');
 }
 
 const bad = results.filter((r) => !r.ok);

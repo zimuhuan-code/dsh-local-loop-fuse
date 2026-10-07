@@ -1026,6 +1026,9 @@ export const apply = (ctx, config) => {
     {
       const pend = sidOfFrame ? p1bPending.get(sidOfFrame) : null;
       if (pend && c.text) {
+        // ⚠️ `frame.turn` **实测不存在**（拾遗核过 dsh 源码：`agent/assistant-stream` 的 chunk frame
+        //   只有 `attemptId/revision/index/time/chunk`，见 dsh-agent-loop `:409-415`）⇒ 这个兜底是
+        //   **防御性**的、当前恒为 undefined：真 turn 只能从 `lastTurnByAgent` 取（它由 `agent/request` 维护）。
         const curTurn = lastTurnByAgent.get(agent) ?? frame.turn ?? null;
         // §B：DEFER 过的窗**绑定它遇到的第一个新 turn**，之后照常走跨 turn 守卫 ——
         //   原来 `deferred=true` 直接豁免了守卫 ⇒ 两个 turn 的文本混进同一读数（实测 segLen 2200 > N 2000）。
@@ -1362,6 +1365,9 @@ export const apply = (ctx, config) => {
           if (pendEnd.acc.length === 0 && reasonKind === 'aborted' && (pendEnd.spans ?? 0) < 1) {
             pendEnd.spans = (pendEnd.spans ?? 0) + 1;
             pendEnd.deferred = true;
+            // §（第 4 轮 ⑤）：**TTL 起点随之重置** —— 否则一个"被合法带进下一个 turn"的窗口，
+            //   会带着上一段已消耗的时间进入新 turn，长窗容易被 TTL 误杀。
+            pendEnd.openedAt = Date.now();
             pendEnd.openTurn = null;   // 🔴 必须清空：绑定逻辑靠 `openTurn == null` 才有机会认领新 turn
                                        //    （不回填的话，守卫会拿旧 turn 直接判 turn-changed 结算掉 —— 实测过）
             note(`P1B-OBSERVE-DEFER session=${sid} attempt=${pendEnd.injectAttempt} `
