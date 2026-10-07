@@ -68,16 +68,20 @@ echo "【③ 效果层 —— 注入后观测（双读数 · **只看注入成�
 #   这里再过滤一次是**对历史日志的防御**。
 # 🔴 §A：**分池**。`attributable=false` = 窗口被 DEFER 过 ⇒ 后面那个 turn 是「用户新发起的」，
 #   循环停没停无法区分（掐断 + 换话题也能造成同样结果）⇒ **不许与可归因样本同池计率**。
+# ⚠️ **分池必须对称**（第 4 轮审阅 ④）：只给「有效」分池 ⇒ 率被系统性压低。
 v_ok=$(c 'P1B-OBSERVE.*verdict=有效.*attributable=true')
+v_no=$(c 'P1B-OBSERVE.*injected=true.*verdict=无效.*attributable=true')
+v_un=$(c 'P1B-OBSERVE.*injected=true.*verdict=不确定.*attributable=true')
 v_okx=$(c 'P1B-OBSERVE.*verdict=有效.*attributable=false')
-v_no=$(c 'P1B-OBSERVE.*injected=true.*verdict=无效')
-v_un=$(c 'P1B-OBSERVE.*injected=true.*verdict=不确定')
+v_noX=$(c 'P1B-OBSERVE.*injected=true.*verdict=无效.*attributable=false')
+v_unX=$(c 'P1B-OBSERVE.*injected=true.*verdict=不确定.*attributable=false')
 v_cut=$(c 'P1B-OBSERVE.*verdict=观察中断')
 v_tot=$((v_ok + v_no + v_un))
 line '有效·可归因（turnsSpanned=0）' "$v_ok" "$v_tot"
-line '有效(跨turn·不可归因) 不计入率' "$v_okx" "$((v_tot + v_okx))"
-line '无效（注入后仍循环）' "$v_no" "$v_tot"
-line '不确定' "$v_un" "$v_tot"
+line '无效·可归因（注入后仍循环）' "$v_no" "$v_tot"
+line '不确定·可归因' "$v_un" "$v_tot"
+v_totX=$((v_okx + v_noX + v_unX))
+line '[不可归因池·只报不判] 有效' "$v_okx" "$v_totX"
 printf '   %-30s %s\n' '观察中断（turn 结束未满 N）' "$v_cut"
 printf '   %-30s %s\n' '带进下一个 turn 观察（DEFER）' "$(c 'P1B-OBSERVE-DEFER')"
 printf '   %-30s %s\n' '注入未确认（窗口在、steer 未 resolve）' "$(c 'P1B-OBSERVE.*verdict=注入未确认')"

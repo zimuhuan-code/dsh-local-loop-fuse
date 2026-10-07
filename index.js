@@ -870,6 +870,15 @@ export const apply = (ctx, config) => {
    *  Agent 上没有反查 session 的公开 helper，但 `agent.session` 是官方字段，
    *  所以每次 agent/request 时顺手登记即可（turn 开始必然先有一次 LLM 请求）。 */
   const agentsBySession = new Map();
+  // §F 收口（第 4 轮审阅 ①②）：**生效值只算一次**，注入处 / loaded 行 / deprecation 判据共用 ——
+  //   三处各写一遍就会漂（实测：loaded 报错生效值、deprecation 判据成死代码）。
+  //   旧键 `p1bSteerMaxPerSession` 的兼容判据 = 「用户显式写了旧键」且「新键仍是 DEFAULTS 值」。
+  const p1bLegacyMax = cfg.p1bSteerMaxPerSession;
+  const p1bEpMax = Math.max(1,
+    (p1bLegacyMax != null && cfg.p1bSteerMaxPerEpisode === DEFAULTS.p1bSteerMaxPerEpisode)
+      ? p1bLegacyMax : (cfg.p1bSteerMaxPerEpisode ?? 2));
+  const p1bHardMax = Math.max(1, cfg.p1bSteerMaxPerSessionHard ?? 8);
+
   /** P1-b 能力自检：已探测过的会话（每个会话只打一行，防空转日志） @type {Set<string>} */
   const capProbed = new Set();
 
@@ -1056,20 +1065,16 @@ export const apply = (ctx, config) => {
           st.p1bDone = true;
           // §F：**两道**上限 —— per-episode（统计要）**加上**会话终身硬顶（安全属性）。
           //   旧键 `p1bSteerMaxPerSession` 仍兼容（作为 per-episode 值）。
-          // ⚠️ 兼容旧键要**比较 DEFAULTS**：新键在 DEFAULTS 里总有默认值 ⇒ `??` 永远取新键、旧键形同虚设。
-          //   判据 = 「用户显式写了旧键」且「新键仍是默认值」⇒ 用旧键。
-          const legacyMax = cfg.p1bSteerMaxPerSession;
-          const epMaxRaw = (legacyMax != null && cfg.p1bSteerMaxPerEpisode === DEFAULTS.p1bSteerMaxPerEpisode)
-            ? legacyMax : (cfg.p1bSteerMaxPerEpisode ?? 2);
-          const epMax = Math.max(1, epMaxRaw);
-          // ⚠️ 硬顶**独立**、绝不能被 epMax 抬高（`Math.max(epMax, hard)` 会让 hard<epMax 时失效 —— 实测踩到）。
-          const hardMax = Math.max(1, cfg.p1bSteerMaxPerSessionHard ?? 8);
+          const epMax = p1bEpMax;       // 生效值统一在 apply() 顶部算一次（第 4 轮 ①②）
+          const hardMax = p1bHardMax;
           const now = Date.now();
           const ep = episodeOf(p1bSteeredBySession, sid, now, cfg.p1bEpisodeWindowMinutes);
           const lifeUsed = sid ? (p1bSteerLifetime.get(sid) ?? 0) : 0;
           const hitAt = st.hits;
-          const canSteer = Boolean(agent && typeof agent.steer === 'function');
-          if (sid && canSteer && (ep.count >= epMax || lifeUsed >= hardMax)) {
+          // §3（第 4 轮）：**没有 sid 就没法计数、也没法观测** ⇒ 不注入。
+          //   原来 `canSteer` 不含 sid，而 QUOTA 条件又要求 `sid` ⇒ 无 sid 时**两道限次被整条旁路**。
+          const canSteer = Boolean(sid && agent && typeof agent.steer === 'function');
+          if (canSteer && (ep.count >= epMax || lifeUsed >= hardMax)) {
             note(`P1B-INJECT-QUOTA session=${sid} turn=${lastTurnByAgent.get(agent) ?? '?'} `
                + `attempt=${frame.attemptId} —— episode=${ep.count}/${epMax} lifetime=${lifeUsed}/${hardMax}`
                + `（episode 窗口 ${cfg.p1bEpisodeWindowMinutes} min；lifetime 为**会话终身硬顶**），跳过`);
@@ -1515,14 +1520,13 @@ export const apply = (ctx, config) => {
   // §1-8：①c/⑤ 的**行为参数必须有 load-time 特征串** —— 否则"日志里没有 P1B-* 行"时
   //   无法区分「没触发」与「跑的是旧代码」（本仓库自己立的规矩，见上面那段注释）。
   note(`loaded v${VERSION} p1bEnabled=${cfg.p1bEnabled} injectAtHit=${cfg.p1bInjectAtHit} `
-     + `observeN=${cfg.p1bObserveChars} steerMaxPerEpisode=${cfg.p1bSteerMaxPerEpisode ?? cfg.p1bSteerMaxPerSession} `
-     + `steerMaxHard=${cfg.p1bSteerMaxPerSessionHard} `
+     + `observeN=${cfg.p1bObserveChars} steerMaxPerEpisode=${p1bEpMax} steerMaxHard=${p1bHardMax} `
      + `episodeWinMin=${cfg.p1bEpisodeWindowMinutes} dropPct=${cfg.p1bSuccessDropPct} `
      + `emptyTurnAction=${cfg.emptyTurnAction} emptyTurnSteerMax=${cfg.emptyTurnSteerMax}`);
   // §F：旧键名兼容 + 一行 deprecation（只有用户显式写了旧键才会走到这里）
-  if (cfg.p1bSteerMaxPerSession != null && cfg.p1bSteerMaxPerEpisode == null) {
+  if (p1bLegacyMax != null && cfg.p1bSteerMaxPerEpisode === DEFAULTS.p1bSteerMaxPerEpisode) {
     note(`loaded v${VERSION} ⚠️ 配置项 p1bSteerMaxPerSession 已改名为 p1bSteerMaxPerEpisode`
-       + `（旧名仍兼容，本次按旧值 ${cfg.p1bSteerMaxPerSession} 生效）`);
+       + `（旧名仍兼容，本次按旧值 ${p1bEpMax} 生效）`);
   }
   // §C：`minChars < p1bObserveChars` ⇒ `k24BeforeWin` 恒小于 `k24AfterWin` ⇒ `comparable=false`
   //   ⇒ **`verdict=有效` 结构上不可达**（测试夹具就是 minChars:1000）。默认两者相等故不咬，但要说出来。
