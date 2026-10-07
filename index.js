@@ -121,6 +121,18 @@ export const DEFAULTS = {
                      //    800 ❌（2010 字符的真循环漏检）；300 ❌（把"长思考里反复引用同一段配置"误判成循环）。
   history: 4000,     // 回溯范围（字符）
   repeats: 3,        // 同一窗口在回溯范围内出现 ≥ repeats 次 ⇒ 判定循环（保持 3：再抬高会漏短循环）
+  // ── ①b 低多样性高重复（v0.8.2 新增；补 ① 线**抓不到**的那一类）────────────
+  // 2026-10-07 真实事故（本机 1.5，三次循环、护栏零反应）逼出来的：
+  //   ① 线是**精确子串匹配**（末尾 window 字符必须原样出现在 history 里），而事故形态是
+  //   **多个短片段交替铺满 + 夹少量噪声**（`（停）→（调用）→（结束）→…`，偶尔插 `d`）
+  //   ⇒ 末尾 600 字符**永远不会精确出现**在 history ⇒ ① 线**一次都不命中**。
+  //   【实测】三段真实循环文本回放：① 线全程 false（日志里连 DETECT 都没有，与现场吻合）。
+  // 判据 = ①「用词极度贫乏」AND ②「同一片段高频重复」—— 两个都要，理由见函数注释。
+  lowDivDetect: true,      // 总开关（false = 退回只有 ① 线精确匹配的行为）
+  lowDivWindow: 2000,      // 统计窗口（字符，取末尾）
+  lowDivNgram: 24,         // 片段长度（字符）
+  lowDivMaxUniq: 40,       // 窗口内**唯一字符数**上限（低于它才算"用词贫乏"）
+  lowDivMinRepeat: 10,     // 同一 lowDivNgram 片段在窗口内出现次数下限
   textStrikesBeforeCancel: 2, // ① 线：**命中达此次数才掐断**（2026-09-30 新增；此前首次命中即掐）
   checkEvery: 200,   // 每新增这么多字符检查一次
   signalMaxAgeMinutes: 10, // 保存的 AbortSignal 超过此时长视为陈旧 ⇒ 不 abort（防御性，见 v0.3.3）
@@ -193,8 +205,8 @@ export const DEFAULTS = {
 // 纯函数区（可单测，见 test-islooping.mjs）
 // ─────────────────────────────────────────────────────────────────────
 
-/** 文本重复检测（v0.1） */
-export function isLooping(buf, cfg) {
+/** 文本重复检测 · **精确子串版**（v0.1）—— 总入口见下方 `isLooping` */
+export function isLoopingExact(buf, cfg) {
   if (buf.length < cfg.minChars) return false;
   const w = Math.min(cfg.window, Math.floor(buf.length / 2));
   if (w < 40) return false;
@@ -215,6 +227,62 @@ export function isLooping(buf, cfg) {
     }
     idx = hist.indexOf(tail, idx + 1);
   }
+  return false;
+}
+
+/**
+ * 低多样性高重复检测（v0.8.2 新增）—— 抓**精确匹配抓不到**的那类原地打转。
+ *
+ * 事故形态（2026-10-07 实测，本机 1.5，有目击者）：模型在 reasoning 里空转，
+ *   **多个短片段交替铺满**（`（停）→（调用）→（结束）→（停）…`），偶尔夹一点噪声（`d`）。
+ *   ⇒ 末尾 window=600 字符**不会原样出现**在 history 里 ⇒ `isLoopingExact` **一次都不命中**
+ *   （三段真实循环文本回放：全程 false）。日志侧吻合：15:20–15:30 连 `DETECT` 都没有。
+ *
+ * 判据 = **两个条件同时成立**：
+ *   ① 窗口内**唯一字符数** < `lowDivMaxUniq` —— 「用词极度贫乏」。
+ *      正常长推理在 2000 字符里通常用 100~400 个不同字符；事故文本只有 32/35/35 个。
+ *   ② 同一 `lowDivNgram` 字符片段出现 ≥ `lowDivMinRepeat` 次 —— 「同一片段反复铺」。
+ *  ⚠️ **两个都必须有，缺一即误杀**：
+ *     · 只有 ② ⇒ 误杀**模板化列表**：`第 N 项：检查完成，结果正常，无需处理。`×160
+ *       实测 k24=**1**（数字在变 ⇒ 24 字符片段不重复）却 k16=84 ⇒ 用 k=24 也挡不住，靠 ① 的 uniq 挡。
+ *     · 只有 ① ⇒ 误杀低多样性但正常的**短枚举/代码块**。
+ *
+ * 误报验证【实测】（2026-10-07）：8 个真实会话日志共 **504 条**长文本（≥2500 字符，
+ *   reasoning+text 块）⇒ 本判据命中 **3 条，而那 3 条正是三段真实循环**
+ *   ⇒ **召回 3/3 · 误报 0/504**。
+ * ⚠️ **诚实边界**：阈值是在这批样本（504 条、8 个会话、同一个模型家族）上定的，
+ *   样本量有限 ⇒ 参数**全部可配**、默认偏保守（**宁可漏也不误杀**），
+ *   上膛前建议再攒样本；要回退只需 `lowDivDetect: false`。
+ */
+export function isLowDiversityLoop(buf, cfg) {
+  const win = cfg.lowDivWindow ?? 2000;
+  const k = cfg.lowDivNgram ?? 24;
+  const maxUniq = cfg.lowDivMaxUniq ?? 40;
+  const minRepeat = cfg.lowDivMinRepeat ?? 10;
+  if (buf.length < win) return false;          // 样本不足整个窗口 ⇒ 不判（保守）
+  const seg = buf.slice(-win);
+  if (new Set(seg).size >= maxUniq) return false;   // ① 用词够丰富 ⇒ 不是这种循环
+  const seen = new Map();
+  for (let i = 0; i + k <= seg.length; i++) {
+    const g = seg.slice(i, i + k);
+    const n = (seen.get(g) ?? 0) + 1;
+    if (n >= minRepeat) return true;           // ② 已达下限 ⇒ 立即返回（不必跑满窗口）
+    seen.set(g, n);
+  }
+  return false;
+}
+
+/**
+ * 文本重复检测（v0.1；v0.8.2 起 = **精确子串 OR 低多样性高重复**）
+ *
+ * 为什么是 OR 而不是替换：`isLoopingExact` 抓得住「**逐字**重放同一段」（历史两次
+ *   真实掐断都是这种，如反复引用同一段配置），但抓不住带噪声的交替打转；
+ *   新判据补后者，**不改前者行为** ⇒ 零回归风险，且可各自配置。
+ */
+export function isLooping(buf, cfg) {
+  if (buf.length < cfg.minChars) return false;
+  if (isLoopingExact(buf, cfg)) return true;
+  if (cfg.lowDivDetect !== false && isLowDiversityLoop(buf, cfg)) return true;
   return false;
 }
 

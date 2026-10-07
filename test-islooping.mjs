@@ -11,7 +11,7 @@
  * 用法：node tools/dsh-local-loop-fuse/test-islooping.mjs
  */
 import fs from 'node:fs';
-import { isLooping, DEFAULTS } from './index.js';
+import { isLooping, isLoopingExact, isLowDiversityLoop, DEFAULTS } from './index.js';
 
 const cfg = DEFAULTS;
 const results = [];
@@ -45,6 +45,34 @@ if (fs.existsSync(realPath) && fs.readFileSync(realPath,'utf8').length > 500) {
   t(`⑥ 真实模型输出（应不触发）[${real.length} 字符]`, real, false);
 } else {
   console.log(`ℹ️  未找到真实样本 ${realPath} —— 跳过 ⑥`);
+}
+
+// ── ⑦ 事故形态：**短片段交替铺满 + 噪声**（2026-10-07 真实循环的合成复现）────────
+// 为什么单列一条：这是 `isLoopingExact` **结构上抓不到**的那一类 ——
+//   它要求末尾 window 字符**原样**出现在 history 里；而这种文本每个约 30 字符的周期
+//   都夹着噪声（`d` / `I must call the tool.`）⇒ 精确匹配永远失败。
+//   【实测】三段真实循环文本（本机 1.5 · 2026-10-07）：exact=false / lowDiv=true，
+//   而日志里 15:20–15:30 连 DETECT 都没有 —— 与"旧判据从不命中"吻合。
+// ⚠️ 本样本**不含任何真实对话原文**（事故文本里有「机主：…」之类），只用形态复现。
+const mkNoisyLoop = (n) => {
+  const frags = ['（停）', '（调用）', '（结束）', '（执行）', '（现在）'];
+  let s = '';
+  for (let i = 0; i < n; i++) {
+    s += frags[i % frags.length] + '\n\n';
+    if (i % 17 === 0) s += 'd\n\n';
+    if (i % 23 === 0) s += 'I must call the tool.\n\n';
+  }
+  return s;
+};
+const noisy = mkNoisyLoop(300);
+t('⑦ 带噪声的交替空转（该触发）', noisy, true);
+{
+  // ⑦b：证明抓住它的是**新判据**（旧精确版必须为 false）—— 防"哪天改回旧版还显示全绿"
+  const exact = isLoopingExact(noisy, cfg);
+  const lowDiv = isLowDiversityLoop(noisy, cfg);
+  const ok = exact === false && lowDiv === true;
+  results.push({ name: '⑦b exact 必须 false 且 lowDiv 必须 true', ok });
+  console.log(`${ok ? '✅' : '❌'}  ⑦b 同一样本：exact=false(${exact}) 且 lowDiv=true(${lowDiv}) —— 证明是新判据抓的`);
 }
 
 // ── 行动层（v0.4.0）单测：checkStall（「无进展」判据）─────────────────────
