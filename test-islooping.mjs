@@ -33,7 +33,7 @@ const para2 = '另一段完全不同的说明文字，用来把上下文隔开�
 const para3 = '再来一段与前面都不相同的描述，作为填充，确保总长度超过检测门槛。';
 t('④ 同段真出现 2 次（不该触发）',
   para.repeat(1) + para2.repeat(12) + para.repeat(1) + para3.repeat(12), false);
-t('④b 模板化列表：60 个相似条目（不该触发，考验误杀）',
+t('④b 模板化列表：160 个相似条目（不该触发，考验误杀）',
   Array.from({ length: 160 }, (_, i) => `第 ${i} 项：检查完成，结果正常，无需处理。`).join('\n'), false);
 t('⑤ 无重复的长文本（不该触发）',
   Array.from({ length: 80 }, (_, i) => `第${i}段内容：${para}编号${i}。`).join('\n'), false);
