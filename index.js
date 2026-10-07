@@ -195,6 +195,13 @@ export const DEFAULTS = {
   //   一个每 ~11 min 循环一次的常驻会话会**永远算新 episode** ⇒ 只靠它等于没有上限
   //   （实测量级 ≈260 条/天永久写进会话存档）。这一条是不可绕过的硬顶。
   p1bSteerMaxPerSessionHard: 8,
+  // 🔴 **额度用尽后要不要动手**（第 3/4 轮审阅留下的 Q2）：`QUOTA` 的含义是
+  //   「本 episode 的注入额度用完，**而它仍在命中**」—— 这是"持续循环"的强证据。
+  //   ⚠️ 危险形状 = **跨 step 循环**：每个 step 只命中一次，永远攒不到 attempt 内的
+  //   `textStrikesBeforeCancel`，于是**既不掐、也不再注入**，就这么一直转。
+  //   `'log'`（默认，发布保守）= 只记一行；`'cancel'` = 复用 `agent.cancel` 掐断该 turn。
+  //   本机由 profile patch 设 `'cancel'`。
+  p1bQuotaAction: 'log',
   // ⚠️ 上面那个上限的**计数单位**（拾遗第 2 轮 §1-2）：按「循环 episode」而不是会话终身制。
   //   会话级终身计数下，一个常驻会话的样本天花板就是 2，而统计脚本自己规定「n<5 不足以下结论」
   //   ⇒ 重启后观察**在统计上不可能出结论**。现在：距上次注入超过本窗口 ⇒ 视为新 episode（计数归零）。
@@ -1078,6 +1085,24 @@ export const apply = (ctx, config) => {
             note(`P1B-INJECT-QUOTA session=${sid} turn=${lastTurnByAgent.get(agent) ?? '?'} `
                + `attempt=${frame.attemptId} —— episode=${ep.count}/${epMax} lifetime=${lifeUsed}/${hardMax}`
                + `（episode 窗口 ${cfg.p1bEpisodeWindowMinutes} min；lifetime 为**会话终身硬顶**），跳过`);
+            // §Q2：额度用尽仍命中 ⇒ 视配置决定是否动手（见 DEFAULTS 里 `p1bQuotaAction` 的说明）
+            if (cfg.p1bQuotaAction === 'cancel' && typeof agent?.cancel === 'function' && !cfg.dryRun) {
+              try {
+                agent.cancel(
+                  { kind: 'hook', reason: 'loop-fuse: p1b quota exhausted, loop still hitting' },
+                  { keepInbox: cfg.cancelKeepInbox },
+                );
+                st.canceled = true;
+                note(`P1B-QUOTA-CANCEL session=${sid ?? '?'} attempt=${frame.attemptId} `
+                   + `episode=${ep.count}/${epMax} lifetime=${lifeUsed}/${hardMax} `
+                   + `keepInbox=${cfg.cancelKeepInbox} ← 额度用尽且仍命中，已掐断`);
+                noteCancel(`CANCEL source=p1b-quota session=${sid ?? '?'} turn=${realTurn ?? '?'} `
+                   + `episode=${ep.count}/${epMax} lifetime=${lifeUsed}/${hardMax} `
+                   + `keepInbox=${cfg.cancelKeepInbox} cause=hook`);
+              } catch (e) {
+                note(`P1B-QUOTA-CANCEL-FAIL session=${sid ?? '?'} attempt=${frame.attemptId} ${String(e).slice(0, 160)}`);
+              }
+            }
           } else {
             const win = Math.min(st.buf.length, cfg.p1bObserveChars);
             const p = {
@@ -1521,7 +1546,7 @@ export const apply = (ctx, config) => {
   //   无法区分「没触发」与「跑的是旧代码」（本仓库自己立的规矩，见上面那段注释）。
   note(`loaded v${VERSION} p1bEnabled=${cfg.p1bEnabled} injectAtHit=${cfg.p1bInjectAtHit} `
      + `observeN=${cfg.p1bObserveChars} steerMaxPerEpisode=${p1bEpMax} steerMaxHard=${p1bHardMax} `
-     + `episodeWinMin=${cfg.p1bEpisodeWindowMinutes} dropPct=${cfg.p1bSuccessDropPct} `
+     + `episodeWinMin=${cfg.p1bEpisodeWindowMinutes} dropPct=${cfg.p1bSuccessDropPct} quotaAction=${cfg.p1bQuotaAction} `
      + `emptyTurnAction=${cfg.emptyTurnAction} emptyTurnSteerMax=${cfg.emptyTurnSteerMax}`);
   // §F：旧键名兼容 + 一行 deprecation（只有用户显式写了旧键才会走到这里）
   if (p1bLegacyMax != null && cfg.p1bSteerMaxPerEpisode === DEFAULTS.p1bSteerMaxPerEpisode) {

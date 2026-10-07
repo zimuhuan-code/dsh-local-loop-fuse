@@ -52,6 +52,7 @@ const mk = (over = {}) => {
     dumpSamples: false,        // ⚠️ 测试不许写进真 samples/（v0.6.0 守卫）
     watchIntervalSec: 3600,
     logPath: LOG,
+    cancelLogPath: `${tmpdir()}/loop-fuse-p1b-cancels-test.log`,   // 防测试写真实切断专账
     dryRun: true,              // 只测**注入**，不测掐断（掐断另有 test-abort/test-cancel）
     minChars: 1000,
     p1bEnabled: true,
@@ -345,6 +346,37 @@ function hitOnce(ctx, agent, attemptId) {
   const log = readLog();
   t('㉒ §C minChars<observeN 会打 P1B-WARN（测试夹具就是 1000<2000）',
     /P1B-WARN minChars\(1000\) < observeN\(2000\)/.test(log));
+}
+
+// ── ㉓ §Q2：额度用尽且仍命中 ⇒ `p1bQuotaAction='cancel'` 时真掐断（跨 step 循环的唯一出路）──
+{
+  const ctx = mk({ p1bSteerMaxPerEpisode: 1, p1bQuotaAction: 'cancel', dryRun: false });
+  const { agent, calls } = mkAgent('s-quotacancel');
+  hitOnce(ctx, agent, 'a1');                 // 第 1 次注入，用掉 episode 额度
+  await sleep(300);
+  feed(ctx, agent, 'b1', A.repeat(8));       // 新 attempt 再命中 ⇒ QUOTA ⇒ 应掐
+  await sleep(400);
+  const log = readLog();
+  t('㉓ §Q2 quotaAction=cancel ⇒ 撞额度即掐断（留痕 + cancel 被调一次）',
+    /P1B-INJECT-QUOTA session=s-quotacancel/.test(log)
+    && /P1B-QUOTA-CANCEL session=s-quotacancel/.test(log)
+    && calls.cancel.length === 1,
+    // ⚠️ `CANCEL source=…` 那行走的是**切断专账**（cancelLogPath），不在主日志 ⇒ 不在这里断言
+    `cancel=${calls.cancel.length} QUOTA=${/P1B-INJECT-QUOTA session=s-quotacancel/.test(log)} CANCEL=${/P1B-QUOTA-CANCEL session=s-quotacancel/.test(log)}`);
+}
+
+// ── ㉔ 默认 `p1bQuotaAction='log'`（发布包行为）：撞额度**只记日志、不掐** ──
+{
+  const ctx = mk({ p1bSteerMaxPerEpisode: 1, dryRun: false });
+  const { agent, calls } = mkAgent('s-quotalog');
+  hitOnce(ctx, agent, 'a1');
+  await sleep(300);
+  feed(ctx, agent, 'b1', A.repeat(8));
+  await sleep(400);
+  const log = readLog();
+  t('㉔ 默认 log ⇒ 有 QUOTA 但**没有** QUOTA-CANCEL（发布包保守）',
+    /P1B-INJECT-QUOTA session=s-quotalog/.test(log) && !/P1B-QUOTA-CANCEL session=s-quotalog/.test(log),
+    `cancel=${calls.cancel.length}`);
 }
 
 const bad = results.filter((r) => !r.ok);

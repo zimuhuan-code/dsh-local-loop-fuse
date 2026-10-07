@@ -168,6 +168,7 @@ grep -n "loop-fuse" <DSH_HOME>/profiles/web/package.json
 | `p1bSuccessDropPct` | `50` | **预注册成功阈值**：`k24` 降到 ≤ 注入前的 50% **且** ① 线不再命中 ⇒ 判"有效" |
 | `p1bSteerMaxPerEpisode` | `2` | **每会话注入上限**（🔴 安全属性，别删）：`attempt` = 一个 step ⇒ 光靠 attempt 内的去重挡不住跨 step 循环（实测一会话 6 条，且每条**永久进会话存档**）|
 | `p1bSteerMaxPerSessionHard` | `8` | **会话终身硬顶**（独立绝对上界；防「每 ~11 min 循环一次」的常驻会话绕过 episode 上限）|
+| `p1bQuotaAction` | `'log'`（作者本机 `'cancel'`）| **额度用尽后动不动手**：`'log'` = 只记一行日志；`'cancel'` = 复用 `agent.cancel` **掐断该 turn** —— 这是**跨 step 循环**（每 step 只命中一次、永远攒不到 attempt 内的 `textStrikesBeforeCancel`）的**唯一出路**；仍受 `dryRun` 约束 |
 | `p1bEpisodeWindowMinutes` | `10` | **注入额度的计数窗口**：距上次注入超过它 ⇒ 视为新的「循环 episode」，额度归零。⚠️ 额度单位必须是 **episode** —— 会话终身制会让样本天花板 = `p1bSteerMaxPerSession`（2），**低于统计脚本自己要求的 n≥5** |
 | `p1bHint` | （见 `DEFAULTS`）| 注入的提示文本（⚠️ 会作为**用户消息**进入会话，等同替使用者发话）|
 | `checkEvery` | `200` | 每新增这么多字符检查一次 |
