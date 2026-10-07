@@ -99,6 +99,24 @@ tf('⑲ 对象型参数也能算（不强依赖字符串）',
   callFingerprint('t', { a: 1 }) === callFingerprint('t', { a: 1 })
   && callFingerprint('t', { a: 1 }) !== callFingerprint('t', { a: 2 }));
 
+// ── v0.8.1：指纹只认**动作参数**（`description` 是自注、不是动作）──────────────
+tf('⑳ description 不同 ⇒ 指纹仍相同（v0.8.1 语义修复）',
+  callFingerprint('pwsh', '{"command":"echo hi","description":"循环探针 1"}')
+  === callFingerprint('pwsh', '{"command":"echo hi","description":"循环探针 2"}'));
+tf('㉑ 剔 description 后，command 仍逐字参与判定（不误伤）',
+  callFingerprint('pwsh', '{"command":"echo hi","description":"x"}')
+  !== callFingerprint('pwsh', '{"command":"echo HI","description":"x"}'));
+tf('㉒ 键序无关（同参不同写法 ⇒ 同一指纹）',
+  callFingerprint('pwsh', '{"a":1,"command":"ls"}') === callFingerprint('pwsh', '{"command":"ls","a":1}'));
+tf('㉓ 线上实况回归：三次「同命令 + 换措辞」⇒ 一个指纹',
+  (() => {
+    const f = (i) => callFingerprint('bash', JSON.stringify({ command: 'echo loop-probe', description: `循环探针 ${i}（同参三次之一）` }));
+    return f(1) === f(2) && f(2) === f(3);
+  })());
+tf('㉔ 非 JSON 参数退化为精确比较（不误判为同一）',
+  callFingerprint('t', 'not-json') === callFingerprint('t', 'not-json')
+  && callFingerprint('t', 'not-json') !== callFingerprint('t', 'not-json-2'));
+
 const bad = results.filter((r) => !r.ok);
 console.log(`\n结果：${results.length - bad.length}/${results.length} 通过` +
   (bad.length ? ` · 未通过：${bad.map((b) => b.name).join(' / ')}` : ' ✅'));

@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-loop-fuse",
-  "version": "0.7.6",
-  "description": "DSH 循环护栏：① assistant-stream 字符重复检测（可 abort）；② session/event 行动层弱信号（turn 时长/步数超限报警）；③ 反复卡住达阈值 ⇒ agent.cancel() 真切断。",
+  "version": "0.8.1",
+  "description": "DSH 循环护栏：① assistant-stream 字符重复检测（可 abort）；② 行动层「无进展」停滞检测；②b 同参工具调用连击（按**动作参数**判定，忽略 description 之类自注）；③ 反复卡住达阈值 ⇒ agent.cancel() 真切断；⑤ 零正文 turn（只有思考、正文为空）检测。",
   "type": "module",
   "main": "index.js",
   "exports": {

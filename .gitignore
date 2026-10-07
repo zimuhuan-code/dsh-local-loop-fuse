@@ -8,3 +8,4 @@ node_modules/
 
 # evidence/ = 刻意发布的脱敏循环证据（覆盖上面的 *.log）
 !evidence/*.log
+exit-check.mjs

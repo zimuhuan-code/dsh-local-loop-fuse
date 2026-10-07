@@ -27,6 +27,22 @@
  *   ③ `loaded` 行的版本号改为**动态读 `package.json`**（此前硬编码 `v0.7.1`，bump 后从不更新，
  *      曾导致"怎么升级日志都写 0.7.1"的误判）。
  *
+ * v0.8.0（2026-10-04）：新增 **⑤ 线「零正文 turn」** —— 这是**第 4 条检测线**（编号取 ⑤ 是因为
+ *   v0.6.0 已把"④"用于 **dump 机制**、并非检测线；文档里别把两者混为一谈）。
+ *   现场（1.5，`session-4fa3d`，2026-10-04 17:33）：连着两轮（`turn 81`/`turn 82`）**只产出 reasoning、
+ *   正文一个字没有** ⇒ 机主在 GUI 里只看到"它停住了"，只能人工喊「停 你循环了」。
+ *   取证（`seq 3407/3418`）：`content` 只有 `reasoning` 块 · `outputTokens === reasoningTokens`
+ *   （3706＝3706 / 1366＝1366）· `stream` 结束是 `{"type":"finish","reason":{"kind":"stop"}}`
+ *   （**正常收尾，不是 `length` 截断**）· provider `maxTokens: 8192` 远未到顶 ·
+ *   该会话 **508 条 assistant/message 里只此 2 条**（0.4%）· 现有三条线**全都没响**
+ *   （没重复 / 时长仅 14.8s·6.8s / 无累积）⇒ 这是**唯一"用户完全看不到任何东西"**的失效形态。
+ *   判别式**极硬且便宜**（纯结构、不看正文）：**整个 turn 里没有 text 块、也没有 tool-call 块**，
+ *   且至少有一条 assistant/message 的 `outputTokens === reasoningTokens > 0`。
+ *   ⚠️ 关键设计取舍：判定放在 **`turn/end`**（一个 turn 有多个 step，中途"暂无正文"是正常的，
+ *   必须等 turn 收口才能断言）；**默认动作为 `log`（只记日志 + 落结构样本，不上膛）** ——
+ *   `steer`（自动补一句"你没有输出正文，请直接给结论"）属于**替机主自动发消息**，是行为改变，
+ *   由机主一行配置决定是否上膛（`emptyTurnAction: 'steer'`）。
+ *
  * ── v0.4.0 为什么推倒重来（2026-10-01 实录，详见知识库
  *    `05-issues/open/loop-fuse-kills-long-tasks.md`）────────────────────
  * 2026-10-01 晚，生产 1.5 跑 ComfyUI 基准测试：两个 turn（15.7 min / 15.6 min）**全程在推进**
@@ -156,6 +172,18 @@ export const DEFAULTS = {
   //    硬编码会让 2.0 去读 1.5 的名单（2026-10-03 实测：2.0 加载行打印的是 1.5 的路径）。
   //    当前 2.0 尚无名单文件 ⇒ 影响为 0，但语义错：在 2.0 上屏蔽的会话不会被 dump 跳过。
   dumpDenylistPath: `${DSH_HOME_DIR}/storages/recall-denylist.json`,
+  // ── ⑤ 零正文 turn（v0.8.0 新增；**检测线第 4 条**，编号取 ⑤ 见文件头）────────
+  // 症状：整个 turn 只有 thinking、没有 text/tool-call ⇒ 用户侧"它停住了"，且现有三条线都抓不到。
+  // 判别式只看**结构**（不看正文）⇒ 不涉及隐私，也不再落一份思考正文（样本里只存结构证据）。
+  emptyTurnDetect: true,     // 总开关
+  emptyTurnLimit: 1,         // 同一会话**连续** N 个零正文 turn 才触发（中间有正常 turn 即归零）。
+                             //   默认 1 = 第一次零正文就记/补救 —— 因为它对用户就是"什么都没看到"；
+                             //   想更保守就调 2（代价：第一轮仍然白等）。
+  emptyTurnAction: 'log',    // 'log' = 只记日志 + 落结构样本（**默认，先观测，不上膛**）
+                             // 'steer' = 另外自动给 agent 补一句「你没输出正文，请直接给结论」
+  emptyTurnSteerMax: 3,      // action='steer' 时，**每会话**最多补救几次（防"补救本身变成新循环"）
+  emptyTurnHint: '⚠️ 系统提示（dsh-local-loop-fuse）：你上一轮**只产出了思考、正文一个字都没有**，'
+    + '用户看不到任何内容。请**直接输出结论**，不要再展开推理。',
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -219,16 +247,87 @@ export function turnOfAttempt(attemptId) {
   return i >= 0 && i < s.length - 1 ? s.slice(i + 1) : undefined;
 }
 
+/** 不参与「动作同一性」判定的参数键：`description` 是模型给这次调用的**自注**，不是动作本身。
+ *  ⚠️ **v0.8.1 修语义 bug**：原先整串 arguments 进指纹 ⇒「同一条命令、每次换一句说明」会被算成
+ *  **不同**调用而漏判（2026-10-05 实测：三次 `echo <同一命令>` 只有 `description` 不同 ⇒
+ *  老口径不命中、剔掉后命中）。指纹的语义是「动作是否同一」，`description` 不是动作 ——
+ *  所以这是**修 bug**，不是"等自然症状再说的调参项"。 */
+const VOLATILE_ARG_KEYS = ['description'];
+
 /**
- * 工具调用指纹（v0.5.0）—— `name + 参数原文` 的轻量哈希（djb2）+ 长度。
+ * 规范化工具参数（v0.8.1）—— 把 `tool/call` 的 arguments 变成「只含动作本身」的稳定字符串。
+ *   · arguments 是**原始 JSON 字符串**（`dsh-session` types.d.ts:333-339）⇒ 先解析；
+ *   · 解析失败（非 JSON）⇒ **原串返回**（退化为精确比较，不误伤）；
+ *   · 顶层键排序 + 剔除 `VOLATILE_ARG_KEYS` ⇒ 键序无关、自注无关。
+ * ⚠️ 只排顶层：工具参数是扁平对象，递归排序会拖慢这条同步热路径。
+ */
+export function canonicalArgs(args) {
+  let v = args;
+  if (typeof v === 'string') {
+    try { v = JSON.parse(v); } catch (e) { return v; }
+  }
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return JSON.stringify(v ?? '');
+  const o = {};
+  for (const k of Object.keys(v).sort()) {
+    if (VOLATILE_ARG_KEYS.indexOf(k) === -1) o[k] = v[k];
+  }
+  return JSON.stringify(o);
+}
+
+/**
+ * 工具调用指纹（v0.5.0；**v0.8.1 改为只对动作参数取指纹**）——
+ * `name + 规范化参数` 的轻量哈希（djb2）+ 长度。
  * 用途：识别「完全相同的工具调用」连击（本地小模型找不到东西时会反复重试同一条命令）。
  * 用纯字符串哈希而非 node:crypto，避免在同步事件处理器里引入异步。
  */
 export function callFingerprint(name, args) {
-  const s = `${name ?? ''}\u0000${typeof args === 'string' ? args : JSON.stringify(args ?? '')}`;
+  const s = `${name ?? ''}\u0000${canonicalArgs(args)}`;
   let h = 5381;
   for (let i = 0; i < s.length; i += 1) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
   return `${(h >>> 0).toString(16)}-${s.length}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v0.8.0 ⑤线：零正文 turn（纯函数，可单测）
+// ─────────────────────────────────────────────────────────────────────
+
+/** 拆一个 assistant/message 的 `content` 数组，看它有没有「正文 / 工具调用 / 思考」。
+ *  ⚠️ 块类型名跨版本不统一 ⇒ 工具调用三种写法都认（`tool-call` / `tool_use` / `function_call`）。 */
+export function classifyAssistantBlocks(content) {
+  const out = { text: false, tool: false, reasoning: false };
+  if (!Array.isArray(content)) return out;
+  for (const b of content) {
+    if (!b || typeof b !== 'object') continue;
+    const t = b.type;
+    if (t === 'text') {
+      if (String(b.text ?? '').trim()) out.text = true;
+    } else if (t === 'tool-call' || t === 'tool_use' || t === 'tool_call' || t === 'function_call') {
+      out.tool = true;
+    } else if (t === 'reasoning' || t === 'thinking') {
+      out.reasoning = true;
+    }
+  }
+  return out;
+}
+
+/**
+ * ⑤线判据（v0.8.0）：这个 turn 是不是**「零正文 turn」**。
+ *
+ * 定义（只看**结构**，不看正文 —— 所以既不涉隐私，也不必把思考再抄一份落盘）：
+ *   **整个 turn 里没有任何 text 块、也没有任何 tool-call 块，但有消息只含 reasoning 块。**
+ *
+ * ⚠️ 为什么要等整个 turn（在 `turn/end` 才判）：一个 turn 可有多个 step，
+ *   中途某个 step"暂时只有思考"完全正常（下一步就会调工具或写正文）。
+ * ⚠️ 为什么要求「至少一条只含 reasoning 的消息」：否则会把**用户刚发出就取消**的空 turn
+ *   （一条 assistant 消息都没有）也算进来 ⇒ 那是用户行为，不是引擎故障。
+ *
+ * @param {{sawText?:boolean, sawTool?:boolean, reasoningOnlyCount?:number}} st 该 turn 的累计状态
+ */
+export function isEmptyTurn(st) {
+  if (!st) return false;
+  if (st.sawText) return false;
+  if (st.sawTool) return false;
+  return (st.reasoningOnlyCount ?? 0) > 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -617,6 +716,79 @@ export const apply = (ctx, config) => {
   // 事件形态：`{type, seq, time, data}`；data 见 dsh-session 的 SessionEventMap。
   // 签名已对过 5 个官方插件（dsh-acp / dsh-agent-loop / dsh-agent-instructions /
   // dsh-agent-presets / dsh-api-session-controller）—— 全部是 `(session, event) => …`。
+  // ── v0.8.0 ⑤线「零正文 turn」的判定与动作 ─────────────────────────
+  /** 同一会话**连续**零正文 turn 计数（中间出现一个正常 turn ⇒ 归零）。 */
+  const emptyTurnStreak = new Map();
+  /** `action:'steer'` 时，每会话已补救次数（防"补救"本身变成新循环）。 */
+  const emptyTurnSteered = new Map();
+
+  /**
+   * ⑤线动作。**只在 `turn/end` 调用**（此时该 turn 的正文已成定局）。
+   * 默认 `emptyTurnAction:'log'` ⇒ 只写日志 + 落**结构样本**（样本里**不含思考正文**）。
+   * 上膛（`'steer'`）= 自动给 agent 补一句「你没有输出正文」—— 属于**替机主自动发消息**，
+   *   所以默认关闭；且受 `emptyTurnSteerMax`（每会话上限）约束。
+   */
+  const evaluateEmptyTurn = (sid, st) => {
+    try {
+      if (!isEmptyTurn(st)) {
+        if ((emptyTurnStreak.get(sid) ?? 0) > 0) emptyTurnStreak.set(sid, 0);  // 有正常 turn ⇒ 断链
+        return;
+      }
+      const streak = (emptyTurnStreak.get(sid) ?? 0) + 1;
+      emptyTurnStreak.set(sid, streak);
+      const limit = Math.max(1, cfg.emptyTurnLimit ?? 1);
+      const stat = `output=${st.outputTokens ?? '?'} reasoning=${st.reasoningTokens ?? '?'} `
+        + `msgs=${st.msgCount ?? 0} reasoningOnly=${st.reasoningOnlyCount ?? 0}`;
+      if (streak < limit) {
+        note(`EMPTY-TURN-PENDING session=${sid} turn=${st.turn} streak=${streak}/${limit} ${stat}`);
+        return;
+      }
+      const action = cfg.emptyTurnAction ?? 'log';
+      note(`EMPTY-TURN session=${sid} turn=${st.turn} streak=${streak}/${limit} action=${action} ${stat}`);
+      // 结构样本：判据是结构性的 ⇒ **不再抄一份思考正文**（少一份内容外泄面）
+      dumpSample({
+        kind: 'empty-turn', sid, turn: st.turn,
+        why: `turn 只有 reasoning、无 text/tool-call（连续 ${streak}/${limit}）`,
+        acted: action === 'steer',
+        evidence: {
+          streak, limit, action,
+          messages: st.msgCount ?? 0, reasoningOnlyMessages: st.reasoningOnlyCount ?? 0,
+          outputTokens: st.outputTokens ?? null, reasoningTokens: st.reasoningTokens ?? null,
+          step: st.step ?? null,
+          startedAtLocal: new Date(st.startedAt ?? Date.now()).toISOString(),
+        },
+      });
+      if (action !== 'steer') return;
+      const maxSteer = Math.max(0, cfg.emptyTurnSteerMax ?? 3);
+      const used = emptyTurnSteered.get(sid) ?? 0;
+      if (used >= maxSteer) {
+        note(`EMPTY-TURN-STEER-SKIP session=${sid} —— 本会话已补救 ${used}/${maxSteer} 次`);
+        return;
+      }
+      const ag = agentsBySession.get(sid);
+      if (!ag || typeof ag.steer !== 'function') {
+        note(`EMPTY-TURN-STEER-SKIP session=${sid}（拿不到 Agent，或它没有 steer）`);
+        return;
+      }
+      // ⚠️ `@deepseek-ai/dsh-llm` 是 **dsh 内部包**；`link:` 装的插件不一定解析得到它
+      //    ⇒ 动态 import + 失败降级（失败只影响这一句补救，其它四条线照常）。
+      import('@deepseek-ai/dsh-llm').then(({ createUserMessage }) => {
+        try {
+          ag.steer(createUserMessage({
+            content: [{ type: 'text', text: cfg.emptyTurnHint }],
+            source: { kind: 'plugin', plugin: name },
+          }));
+          emptyTurnSteered.set(sid, used + 1);
+          note(`EMPTY-TURN-STEER session=${sid} turn=${st.turn}（第 ${used + 1}/${maxSteer} 次）`);
+        } catch (e) {
+          note(`EMPTY-TURN-STEER-FAIL session=${sid} ${String(e).slice(0, 160)}`);
+        }
+      }).catch((e) => {
+        note(`EMPTY-TURN-STEER-FAIL session=${sid}（import 失败：${String(e).slice(0, 120)}）`);
+      });
+    } catch { /* 绝不影响会话事件链 */ }
+  };
+
   const progressSet = new Set(cfg.progressEvents ?? DEFAULTS.progressEvents);
   let sawFirstEvent = false;
   ctx.on('session/event', (session, event) => {
@@ -641,10 +813,16 @@ export const apply = (ctx, config) => {
           startedAt: Date.now(), lastProgressAt: Date.now(),
           pendingTools: 0, warned: false,
           lastCallFp: '', lastCallCount: 0,     // v0.5.0：同参调用连击计数
+          // ── v0.8.0 ⑤线：本 turn 的"有没有正文/工具调用"累计账 ──────────
+          msgCount: 0, sawText: false, sawTool: false, reasoningOnlyCount: 0,
+          outputTokens: 0, reasoningTokens: 0,
         });
         return;
       }
       if (type === 'turn/end') {
+        // ── v0.8.0 ⑤线：**turn 收口才判**「零正文」（多 step 的 turn 中途无正文是正常的）──
+        const stEnd = turns.get(`${sid}#${d.turn}`);
+        if (stEnd && cfg.emptyTurnDetect !== false) evaluateEmptyTurn(sid, stEnd);
         turns.delete(`${sid}#${d.turn}`);
         killed.delete(`${sid}#${d.turn}`);   // 2026-10-03：turn 结束即清（条目已无用，防 Set 无限增长）
         return;
@@ -657,6 +835,22 @@ export const apply = (ctx, config) => {
       if (progressSet.has(type)) {
         st.lastProgressAt = Date.now();
         if (d.step != null) st.step = Math.max(st.step ?? 0, d.step);
+      }
+      // ── v0.8.0 ⑤线：累计"这个 turn 到底有没有正文 / 工具调用" ──────────
+      //    ⚠️ 只统计**块类型**，不读正文内容（判据是结构性的，也不需要复制思考正文）。
+      if (type === 'assistant/message') {
+        const cls = classifyAssistantBlocks(d.message?.content);
+        st.msgCount = (st.msgCount ?? 0) + 1;
+        if (cls.text) st.sawText = true;
+        if (cls.tool) st.sawTool = true;
+        if (cls.reasoning && !cls.text && !cls.tool) {
+          st.reasoningOnlyCount = (st.reasoningOnlyCount ?? 0) + 1;
+        }
+        const u = d.usage;
+        if (u && Number.isFinite(u.outputTokens)) {
+          st.outputTokens = (st.outputTokens ?? 0) + u.outputTokens;
+          st.reasoningTokens = (st.reasoningTokens ?? 0) + (Number(u.reasoningTokens) || 0);
+        }
       }
       // 未返回的工具调用计数（长工具豁免的依据）
       if (type === 'tool/call') {
@@ -798,6 +992,29 @@ export const apply = (ctx, config) => {
   note(`loaded v${VERSION} dumpSamples=${cfg.dumpSamples} dumpDir=${cfg.dumpDir} `
      + `dumpMaxChars=${cfg.dumpMaxChars} dumpKeep=${cfg.dumpKeep} dumpRedact=${cfg.dumpRedact} `
      + `dumpDenylistPath=${cfg.dumpDenylistPath}`);
+  note(`loaded v${VERSION} emptyTurnDetect=${cfg.emptyTurnDetect} emptyTurnLimit=${cfg.emptyTurnLimit} `
+     + `emptyTurnAction=${cfg.emptyTurnAction} emptyTurnSteerMax=${cfg.emptyTurnSteerMax}`);
+
+  // ─────────────────────────────────────────────────────────────────────
+  // ⚠️ 可选挂载点（**维护者本机的实验代码，不属于本项目的功能**）
+  //   见 README「关于 index.js 末尾的可选挂载点」一节 —— 那里是对使用者的完整说明。
+  //   * `exit-check.mjs` **不在** `package.json` 的 `files` 白名单里 ⇒ **发布包里没有这个文件**；
+  //     干净安装下它不存在 ⇒ 下面的 `import` 失败、被 `catch` 吞掉，插件功能与日志一切照常。
+  //   * ⚠️ **但它是一个挂载点，不是一段死代码**：谁能往**包目录**里写一个同名文件
+  //     （别的包的 `postinstall`、被投毒的依赖、构建脚本…），谁就能在插件加载时执行代码，
+  //     并拿到**活的**插件上下文 `ctx` 与本包的配置。**0.7.6 没有这个面** ——
+  //     这是本版本**新增**的，也是它**将来必须被删掉**的原因之一。
+  //   * ESM 的相对说明符以**本文件所在目录**为基准解析（**不是 cwd**）⇒ 它**不会**加载
+  //     使用者项目里恰好同名的文件。（2026-10-07 实测两个方向：同名文件放 cwd、包目录里没有
+  //     ⇒ 不加载；包目录里有 ⇒ 加载。两个方向都只认包目录。）
+  //   * 它有**本机范围内**的别的用途，**该用途不在本项目的范围内**，此处不作说明。
+  //   * 🔻 **将来会移除**：现在还在，是因为它对应的那份本机工作尚未收尾；
+  //     移除 = 删掉下面这几行 import（连同本段注释）。
+  // ─────────────────────────────────────────────────────────────────────
+  note(`loaded v${VERSION} probeMountPoint=optional —— exit-check.mjs 不在发布包内，不属于本项目功能，将来移除（见 README）`);
+  import('./exit-check.mjs')
+    .then((m) => m.attach(ctx, cfg, { redactSecrets }))
+    .catch(() => { /* 文件不存在 = 未启用，正常路径 */ });
 };
 
 export const Config = undefined;

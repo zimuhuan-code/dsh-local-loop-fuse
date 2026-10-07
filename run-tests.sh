@@ -20,7 +20,7 @@ echo
 
 fail=0
 TMP="$(mktemp)"
-for t in test-islooping.mjs test-abort.mjs test-cancel.mjs test-dump.mjs; do
+for t in test-islooping.mjs test-abort.mjs test-cancel.mjs test-dump.mjs test-empty-turn.mjs; do
   printf '═══ %s ═══\n' "$t"
   node "$t" >"$TMP" 2>&1
   rc=$?
