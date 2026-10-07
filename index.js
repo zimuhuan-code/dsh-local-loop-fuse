@@ -780,6 +780,8 @@ export const apply = (ctx, config) => {
    *  Agent 上没有反查 session 的公开 helper，但 `agent.session` 是官方字段，
    *  所以每次 agent/request 时顺手登记即可（turn 开始必然先有一次 LLM 请求）。 */
   const agentsBySession = new Map();
+  /** P1-b 能力自检：已探测过的会话（每个会话只打一行，防空转日志） @type {Set<string>} */
+  const capProbed = new Set();
 
   ctx.on('agent/request', async (payload, next) => {
     const resolved = await next();
@@ -788,6 +790,18 @@ export const apply = (ctx, config) => {
       if (agent && signal) signals.set(agent, { signal, turn, at: Date.now() });
       const sid = agent?.session?.id ?? agent?.session?.header?.id;
       if (sid) agentsBySession.set(sid, agent);
+      // ── ①c P1-b **能力自检**（2026-10-07 机主定「**先解决能不能注入**」）────────────
+      // 为什么要有它：`agent.steer` 能不能用，原先**只能等一次真循环**才知道 ——
+      //   而今天它是 **0 次触发**（`grep -c EMPTY-TURN-STEER` = 0）⇒ 那条路等于没法验证。
+      //   这里在**任何一次 LLM 请求**时就地探测并留痕 ⇒ **不必等循环**就能回答"API 在不在"。
+      // ⚠️ 边界：它回答的是「**能力在不在**」，**不回答**「注入有没有用」——
+      //   后者必须真循环 + 观测（`P1B-OBSERVE`），两者别混。
+      if (sid && !capProbed.has(sid)) {
+        capProbed.add(sid);
+        note(`P1B-CAPABILITY session=${sid} steer=${typeof agent?.steer === 'function'} `
+           + `cancel=${typeof agent?.cancel === 'function'} inbox=${typeof agent?.inbox} `
+           + `—— steer=false ⇒ P1-b 与 ⑤ 线**都注入不了**，必须先解决这一层（不是调参能救的）`);
+      }
       if (agent && turn != null) lastTurnByAgent.set(agent, turn);
     } catch { /* 绝不因自身异常影响请求链 */ }
     return resolved;   // ← 必须原样透传下游结果
