@@ -172,6 +172,24 @@ const REAL_EMPTY_USAGE = { inputTokens: 753, outputTokens: 3706, reasoningTokens
     && /(EMPTY-TURN-STEER-SKIP|EMPTY-TURN-STEER-FAIL|EMPTY-TURN-STEER) session=sess-steer/.test(log));
 }
 
+{
+  // ⑤ 线**会话终身硬顶**（与 ①c 同款）：episode 额度还很大，但终身额度已用完 ⇒ 必须 SKIP
+  const ctx = mk({ emptyTurnAction: 'steer', emptyTurnSteerMax: 99, emptyTurnSteerMaxSessionHard: 1 });
+  // ⚠️ ⑤ 线的补救走 `agentsBySession`（不是随便找 agent）⇒ 本文件其余用例只发 session/event，
+  //    所以"拿不到 Agent"分支会先命中、lifetime 根本不会增长。这里显式注册一个假 agent（照 test-p1b 做法）。
+  const agent05 = { session: { id: 's-hard05' }, inbox: {}, cancel() {}, steer() {} };
+  await Promise.all(ctx.fire('agent/request',
+    { agent: agent05, turn: 1, signal: new AbortController().signal }, async () => ({})));
+  playTurn(ctx, 's-hard05', 1, [REASON], REAL_EMPTY_USAGE);   // 第 1 次补救（lifetime 1/1）
+  await sleep(700);
+  playTurn(ctx, 's-hard05', 2, [REASON], REAL_EMPTY_USAGE);   // 撞终身硬顶
+  await sleep(700);
+  const log = readLog();
+  t('⑳ ⑤ 线会话终身硬顶：episode 还有额度也用完 ⇒ SKIP 带 lifetime 1/1',
+    /EMPTY-TURN-STEER-SKIP session=s-hard05 .*lifetime 1\/1/.test(log),
+    log.match(/EMPTY-TURN-STEER-SKIP[^\n]*/)?.[0]?.slice(0, 110) ?? '(无日志)');
+}
+
 const bad = results.filter((r) => !r.ok);
 console.log(`\n结果：${results.length - bad.length}/${results.length} 通过`
   + (bad.length ? ` · 未通过：${bad.map((b) => b.name).join(' / ')}` : ' ✅'));

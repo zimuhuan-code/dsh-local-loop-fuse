@@ -186,6 +186,7 @@ grep -n "loop-fuse" <DSH_HOME>/profiles/web/package.json
 | `emptyTurnDetect` | `true` | **⑤ 线总开关**：整个 turn 只有思考、正文一个字都没有 ⇒ 检出（判别式只看**结构**，不落思考正文）|
 | `emptyTurnLimit` | `1` | 同一会话**连续** N 个零正文 turn 才触发（中间有正常 turn 即归零）|
 | `emptyTurnAction` | `'log'`（作者本机显式 `'steer'`）| `'log'` = 只记日志 + 落结构样本；`'steer'` = **另自动补一句「你没输出正文」提示**。⚠️ 与 ①c 同一条原则：**替使用者发消息的动作，发布包默认关闭** |
+| `emptyTurnSteerMaxSessionHard` | `12` | **⑤ 线的会话终身硬顶**（与 ①c 的 `…Hard` 同款：per-episode 挡不住"每 ~11 分钟来一次零正文"的常驻会话）|
 | `emptyTurnSteerMax` | `3` | `action='steer'` 时**每会话**最多补救几次（防"补救本身变成新循环"）|
 | `emptyTurnHint` | （见 `DEFAULTS`）| ⑤ 线注入的提示文本 |
 | `watchIntervalSec` | `60` | 行动层定时扫描间隔（秒） |

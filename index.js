@@ -275,7 +275,11 @@ export const DEFAULTS = {
                              //   「**替使用者自动发消息**，且会写进 durable transcript」⇒ 按同一条原则保守默认；
                              //   本机由 `profiles/web/cordis.patch.yml` 显式钉 `'steer'`（行为不变）。
                              // 限次：`emptyTurnSteerMax`（**每会话 3 次**，防"补救本身变成新循环"）。
-  emptyTurnSteerMax: 3,      // action='steer' 时，**每会话**最多补救几次（防"补救本身变成新循环"）
+  emptyTurnSteerMax: 3,      // action='steer' 时，**每 episode**最多补救几次（防"补救本身变成新循环"）
+  // 🔴 **会话终身硬顶**（与 ①c 的 `p1bSteerMaxPerSessionHard` 同款、同理由）：
+  //   `emptyTurnSteerMax` 是 per-episode（滑动窗口）⇒ 一个长期常驻会话里"每 11 分钟来一次零正文"
+  //   会永远算新 episode ⇒ 只靠它等于没有上限。这条是不可绕过的绝对上界。
+  emptyTurnSteerMaxSessionHard: 12,
   emptyTurnHint: '⚠️ 系统提示（dsh-local-loop-fuse）：你上一轮**只产出了思考、正文一个字都没有**，'
     + '用户看不到任何内容。请**直接输出结论**，不要再展开推理。',
 };
@@ -1240,6 +1244,8 @@ export const apply = (ctx, config) => {
   const emptyTurnStreak = new Map();
   /** `action:'steer'` 时，每会话已补救次数（防"补救"本身变成新循环）。 */
   const emptyTurnSteered = new Map();
+  /** ⑤ 线**终身**补救计数（§与 ①c 同款：per-episode 挡不住"每 ~11 分钟来一次"的常驻会话） @type {Map<string, number>} */
+  const emptyTurnLifetime = new Map();
 
   /**
    * ⑤线动作。**只在 `turn/end` 调用**（此时该 turn 的正文已成定局）。
@@ -1284,8 +1290,11 @@ export const apply = (ctx, config) => {
       //   否则一个常驻会话里第 3 次以后的零正文 turn 永远不会被补救（同一原则两处必须一起动）。
       const now05 = Date.now();
       const used = episodeOf(emptyTurnSteered, sid, now05, cfg.p1bEpisodeWindowMinutes).count;
-      if (used >= maxSteer) {
-        note(`EMPTY-TURN-STEER-SKIP session=${sid} —— 本 episode 已补救 ${used}/${maxSteer} 次`);
+      const hard05 = Math.max(1, cfg.emptyTurnSteerMaxSessionHard ?? 12);
+      const life05 = emptyTurnLifetime.get(sid) ?? 0;
+      if (used >= maxSteer || life05 >= hard05) {
+        note(`EMPTY-TURN-STEER-SKIP session=${sid} —— episode ${used}/${maxSteer} · `
+           + `lifetime ${life05}/${hard05}（后者为**会话终身硬顶**）`);
         return;
       }
       const ag = agentsBySession.get(sid);
@@ -1296,6 +1305,7 @@ export const apply = (ctx, config) => {
       // ⚠️ 与 ①c P1-b 共用 `steerHint()` —— 内部含动态 import + 失败降级。
       steerHint(ag, cfg.emptyTurnHint, name).then((via) => {
         emptyTurnSteered.set(sid, { count: used + 1, lastAt: now05 });
+        emptyTurnLifetime.set(sid, life05 + 1);
         note(`EMPTY-TURN-STEER session=${sid} turn=${st.turn} via=${via}（第 ${used + 1}/${maxSteer} 次）`);
       }).catch((e) => {
         note(`EMPTY-TURN-STEER-FAIL session=${sid} ${String(e).slice(0, 160)}`);
@@ -1532,7 +1542,8 @@ export const apply = (ctx, config) => {
      + `dumpMaxChars=${cfg.dumpMaxChars} dumpKeep=${cfg.dumpKeep} dumpRedact=${cfg.dumpRedact} `
      + `dumpDenylistPath=${cfg.dumpDenylistPath}`);
   note(`loaded v${VERSION} emptyTurnDetect=${cfg.emptyTurnDetect} emptyTurnLimit=${cfg.emptyTurnLimit} `
-     + `emptyTurnAction=${cfg.emptyTurnAction} emptyTurnSteerMax=${cfg.emptyTurnSteerMax}`);
+     + `emptyTurnAction=${cfg.emptyTurnAction} emptyTurnSteerMax=${cfg.emptyTurnSteerMax} `
+     + `emptyTurnSteerMaxHard=${cfg.emptyTurnSteerMaxSessionHard}`);
   // ⚠️ 为什么把 ①b/①b-2 参数也打出来（2026-10-07 加）：**代码改动没有"特征串"就没法判生效**。
   //    本机踩过两次：① `loaded v0.8.1` 的版本号是**运行时读 package.json** ⇒ 旧代码进程重启后
   //    照样打印新版本号；② 滑窗支加完时，`loaded` 行**一个字都没变** ⇒ 只能靠
