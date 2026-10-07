@@ -104,6 +104,9 @@ export const inject = [];
 /** 默认阈值：刻意宽松（宁漏报不误杀 —— 机主 2026-09-28 定的原则） */
 export const DEFAULTS = {
   enabled: true,
+  // 可选挂载点**默认关闭**（v0.8.1）：`exit-check.mjs` 只在本机**显式打开**时才会被加载。
+  //   ⇒ 默认情况下本包**不会 import 任何本地文件**；见 README「关于 index.js 末尾的可选挂载点」。
+  probeMount: false,
   // ⚠️ 2026-09-29 夜 **机主决定上膛**（此前 dryRun 观测期已攒到真实样本：12:15 企微 1 条 +
   //    19:58 本会话 6 条命中，hits 1→6、len 1.95万→2.28万字符；另有 5.7 万字符正常输出不误杀对照）。
   //    上膛后 ① 线命中即 `agent.cancel({kind:'hook',reason},{keepInbox:true})` 掐断当前 turn。
@@ -1000,10 +1003,12 @@ export const apply = (ctx, config) => {
   //   见 README「关于 index.js 末尾的可选挂载点」一节 —— 那里是对使用者的完整说明。
   //   * `exit-check.mjs` **不在** `package.json` 的 `files` 白名单里 ⇒ **发布包里没有这个文件**；
   //     干净安装下它不存在 ⇒ 下面的 `import` 失败、被 `catch` 吞掉，插件功能与日志一切照常。
-  //   * ⚠️ **但它是一个挂载点，不是一段死代码**：谁能往**包目录**里写一个同名文件
-  //     （别的包的 `postinstall`、被投毒的依赖、构建脚本…），谁就能在插件加载时执行代码，
-  //     并拿到**活的**插件上下文 `ctx` 与本包的配置。**0.7.6 没有这个面** ——
-  //     这是本版本**新增**的，也是它**将来必须被删掉**的原因之一。
+  //   * ⚠️ **但它是一个挂载点，不是一段死代码**：**谁能把 `probeMount` 打开、
+  //     又能在包目录里写一个同名文件**，谁就能在插件加载时执行代码，并拿到**活的**插件
+  //     上下文 `ctx` 与本包的配置。**0.7.6 没有这个面** —— 这是本版本新增的，
+  //     也是它**将来必须被删掉**的原因之一。
+  //     为把默认暴露面**降到零**，v0.8.1 给它加了配置开关 `probeMount`（**默认 `false`**）：
+  //     不开就不会 `import` 任何文件 ⇒ 只有**显式打开它的人**才可能碰到上面那条路径。
   //   * ESM 的相对说明符以**本文件所在目录**为基准解析（**不是 cwd**）⇒ 它**不会**加载
   //     使用者项目里恰好同名的文件。（2026-10-07 实测两个方向：同名文件放 cwd、包目录里没有
   //     ⇒ 不加载；包目录里有 ⇒ 加载。两个方向都只认包目录。）
@@ -1012,9 +1017,11 @@ export const apply = (ctx, config) => {
   //     移除 = 删掉下面这几行 import（连同本段注释）。
   // ─────────────────────────────────────────────────────────────────────
   note(`loaded v${VERSION} probeMountPoint=optional —— exit-check.mjs 不在发布包内，不属于本项目功能，将来移除（见 README）`);
-  import('./exit-check.mjs')
-    .then((m) => m.attach(ctx, cfg, { redactSecrets }))
-    .catch(() => { /* 文件不存在 = 未启用，正常路径 */ });
+  if (cfg.probeMount === true) {          // ← 默认 false：不开就不加载任何东西
+    import('./exit-check.mjs')
+      .then((m) => m.attach(ctx, cfg, { redactSecrets }))
+      .catch(() => { /* 文件不存在 = 未启用，正常路径 */ });
+  }
 };
 
 export const Config = undefined;
