@@ -174,7 +174,11 @@ export const DEFAULTS = {
   //   ③ 无预注册 ⇒ 注入点 / N / 成功阈值**全部配置化并在日志里打印**；
   //   ④ **基础率 2/6**（本簇 6 段真循环有 2 段自愈）⇒ 单次"注入后它停了"**不算证据**，日志明记。
   // ⚠️ 本项**会替机主自动发消息**（同 ⑤ 线 steer 一类动作）；发布包里应默认 false。
-  p1bEnabled: true,          // 总开关
+  // ⚠️ 默认 **false**（2026-10-07 对齐 0.8.1 的 `probeMount` 模式）：本项**替使用者自动发消息**
+  //   （往会话里注入一条 user 消息）⇒ 保守默认 = **发布包不自动注入**，要用的人显式打开。
+  //   本机（1.5）由 `profiles/web/cordis.patch.yml` 显式 `p1bEnabled: true` 保持行为不变。
+  //   撤销条件：机主决定不再要这条时，删 patch 里那行（改完需重启 dsh）。
+  p1bEnabled: false,         // 总开关（发布包默认 false；本机由配置钉 true）
   p1bInjectAtHit: 1,         // **预注册**：第几次 ① 线命中后注入（1 = 首次命中即注入）
   p1bObserveChars: 2000,     // **预注册 N**：注入后再观察这么多字符才判
   p1bSuccessDropPct: 50,     // **预注册成功阈值**：k24 降到 ≤ 注入前的 50% **且** ① 线不再命中
@@ -398,6 +402,75 @@ export function k24Max(s, k = 24) {
     m.set(g, v);
   }
   return best;
+}
+
+/**
+ * 递归冻结（等价于 dsh `createUserMessage` 内部做的 `deepFreeze`）。
+ * 消息进入 inbox 后会被 dsh 当作**不可变**值使用 ⇒ 自建消息必须同样冻结。
+ */
+function deepFreeze(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const v of Object.values(value)) deepFreeze(v);
+  }
+  return value;
+}
+
+/**
+ * 构造一条要交给 `agent.steer()` 的 **UserMessage** —— ①c P1-b 与 ⑤ 线**共用**。
+ *
+ * 两条路，按优先级：
+ *  1. `dsh-llm` —— 官方构造器 `createUserMessage()`（语义最正、随 dsh 演进而变）；
+ *  2. `self-built` —— **自建兜底**：`{ id, role:'user', content, source }` + 深冻结
+ *     （`createUserMessage` 运行时做的就是"补 `id` + `deepFreeze(structuredClone())`"，
+ *      而 `brandString` 是**编译期**品牌、运行时是恒等函数 —— 见 dsh-brand 的 `index.js`）。
+ *
+ * ⚠️ **为什么必须有兜底**（2026-10-07 · 写 `test-p1b.mjs` 时抓到，两连 bug）：
+ *   - 第一层：①c 起初**直接调用** `createUserMessage(...)`，而它**从未被 import**
+ *     ⇒ 每次注入都 `ReferenceError`（`P1B-INJECT-FAIL`）⇒ P1-b **上线即失效**；
+ *   - 第二层（修完第一层才暴露）：`@deepseek-ai/dsh-llm` 是 dsh 内部包，
+ *     `link:` 插件的解析路径上**够不着它**（`ERR_MODULE_NOT_FOUND`）⇒ **照样注入不了**。
+ *   ⚠️ 兜底路径能否被 dsh 正常消费 = **【待验证】**（需重启 dsh 后在真实会话里看）；
+ *     日志用 `via=` 区分走了哪条路，便于回查。
+ *
+ * @returns {Promise<{ via: 'dsh-llm'|'self-built', message: object }>}
+ */
+async function buildSteerMessage(text, plugin = 'dsh-local-loop-fuse') {
+  try {
+    const { createUserMessage } = await import('@deepseek-ai/dsh-llm');
+    return {
+      via: 'dsh-llm',
+      message: createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin } }),
+    };
+  } catch {
+    const { randomUUID } = await import('node:crypto');
+    return {
+      via: 'self-built',
+      message: deepFreeze({
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text }],
+        source: { kind: 'plugin', plugin },
+      }),
+    };
+  }
+}
+
+/**
+ * 向 agent 注入一条**系统提示**（user 消息）—— ①c P1-b 与 ⑤ 线**共用**这一个实现。
+ *
+ * ⚠️ 两条注入路径**必须共用本函数**：各写一遍就会重演上面那两层 bug（未定义 / 拿不到包）。
+ *   测试（`test-p1b.mjs`）是这条约束的防线。
+ *
+ * @param {object} agent 具备 `steer` 的 Agent
+ * @param {string} text 提示正文
+ * @param {string} [plugin] 来源标注（写进消息的 `source.plugin`）
+ * @returns {Promise<'dsh-llm'|'self-built'>} 实际走的构造路径（调用方写进日志）
+ */
+async function steerHint(agent, text, plugin = 'dsh-local-loop-fuse') {
+  const { via, message } = await buildSteerMessage(text, plugin);
+  agent.steer(message);
+  return via;
 }
 
 /**
@@ -798,9 +871,13 @@ export const apply = (ctx, config) => {
       //   后者必须真循环 + 观测（`P1B-OBSERVE`），两者别混。
       if (sid && !capProbed.has(sid)) {
         capProbed.add(sid);
+        // ⚠️ 本行是 `p1b-stats.sh` 的**机器可读行**：格式必须保持 `steer=<bool> cancel=<bool>`，
+        //   说明文字里**不要再出现布尔字面量** —— v0.8.2 首版这里写了 `steer=false ⇒ …`，
+        //   被统计脚本的宽正则在同一行上数了两次 ⇒ 报出假的 `1/2 = 50%` 与一条假 🚩。
         note(`P1B-CAPABILITY session=${sid} steer=${typeof agent?.steer === 'function'} `
            + `cancel=${typeof agent?.cancel === 'function'} inbox=${typeof agent?.inbox} `
-           + `—— steer=false ⇒ P1-b 与 ⑤ 线**都注入不了**，必须先解决这一层（不是调参能救的）`);
+           + `—— 能力探测行：注入要求 steer 可用（P1-b 与 ⑤ 线共用同一个 API）；`
+           + `拿不到就先解决这一层，不是调参能救的`);
       }
       if (agent && turn != null) lastTurnByAgent.set(agent, turn);
     } catch { /* 绝不因自身异常影响请求链 */ }
@@ -840,13 +917,18 @@ export const apply = (ctx, config) => {
     if (st.p1b && st.buf.length >= st.p1b.until) {
       const p = st.p1b; st.p1b = null;
       const k24After = k24Max(st.buf.slice(-cfg.p1bObserveChars));
-      const still = isLooping(st.buf, cfg);
+      // ⚠️ **读数 2 的口径 = 注入之后新增的那一段**（不是整个 buf）—— 2026-10-07 写 `test-p1b.mjs`
+      //   时发现：① 线（尤其滑窗支）判的是**全文**，而注入点之前那段循环**永久留在 `buf` 里**
+      //   ⇒ 用整个 `buf` 作读数 ⇒ `line1StillHits` **恒为 true** ⇒ verdict 永远"无效"，观测等于白做。
+      //   现在只问一件事：「**注入之后这一段**还在循环吗」。
+      const seg = st.buf.slice(p.at);
+      const still = seg.length >= cfg.minChars ? isLooping(seg, cfg) : null; // null = 观察量不足 ⇒ 不确定
       const drop = p.k24Before > 0 ? Math.round((1 - k24After / p.k24Before) * 100) : 0;
       const ok = p.k24Before > 0
-        && k24After <= p.k24Before * (1 - cfg.p1bSuccessDropPct / 100) && !still;
+        && k24After <= p.k24Before * (1 - cfg.p1bSuccessDropPct / 100) && still === false;
       note(`P1B-OBSERVE session=${agent?.session?.id ?? '?'} turn=${turnOfAttempt(frame.attemptId) ?? '?'} `
-         + `N=${cfg.p1bObserveChars} k24Before=${p.k24Before} k24After=${k24After} drop=${drop}% `
-         + `line1StillHits=${still} injected=${p.injected} verdict=${ok ? '有效' : (still ? '无效' : '不确定')} `
+         + `N=${cfg.p1bObserveChars} segLen=${seg.length} k24Before=${p.k24Before} k24After=${k24After} drop=${drop}% `
+         + `line1StillHits=${still} injected=${p.injected} verdict=${ok ? '有效' : (still === true ? '无效' : '不确定')} `
          + `—— ⚠️ 基础率 2/6 ⇒ 单次只作记录、不作结论`);
     }
 
@@ -863,7 +945,12 @@ export const apply = (ctx, config) => {
         // ── ①c P1-b：首次命中时注入「停止」类词（**带预注册观测**；见 DEFAULTS 里的长注释）──
         // ⚠️ 与 ⑤ 线**共用 `agent.steer`**（同一 API、另一个触发条件）；**每 attempt 只注入一次**。
         // ⚠️ 本动作**替机主自动发消息** ⇒ 失败/拿不到能力时必须留痕（SKIP/FAIL），不许静默。
-        if (cfg.p1bEnabled !== false && !st.p1b && st.hits >= (cfg.p1bInjectAtHit ?? 1)) {
+        // ⚠️ `p1bDone`：**每 attempt 最多尝试注入一次**。观测窗口结束会把 `st.p1b` 置回 `null`，
+        //   只靠 `!st.p1b` 判断 ⇒ 命中持续时**会二次、三次注入**（2026-10-07 写 `test-p1b.mjs`
+        //   时发现：原文注释写着"每 attempt 只注入一次"，但代码做不到）。
+        //   SKIP/FAIL 也算"尝试过" ⇒ 不重试、不刷日志。
+        if (cfg.p1bEnabled !== false && !st.p1b && !st.p1bDone && st.hits >= (cfg.p1bInjectAtHit ?? 1)) {
+          st.p1bDone = true;
           const win = Math.min(st.buf.length, cfg.p1bObserveChars);
           st.p1b = {
             at: st.buf.length,
@@ -871,19 +958,21 @@ export const apply = (ctx, config) => {
             k24Before: k24Max(st.buf.slice(-win)),
             injected: false,
           };
-          try {
-            if (agent && typeof agent.steer === 'function') {
-              agent.steer(createUserMessage({ content: [{ type: 'text', text: cfg.p1bHint }] }));
-              st.p1b.injected = true;
-              note(`P1B-INJECT session=${sid ?? '?'} turn=${turn ?? '?'} hit=${st.hits} `
-                 + `atChar=${st.p1b.at} k24Before=${st.p1b.k24Before} observeN=${cfg.p1bObserveChars} `
+          const p = st.p1b;
+          const hitAt = st.hits;
+          if (agent && typeof agent.steer === 'function') {
+            // ⚠️ 动态 import ⇒ 不能阻塞流式事件链；**成败都留痕**（本项替使用者发消息，不许静默）
+            steerHint(agent, cfg.p1bHint, name).then((via) => {
+              p.injected = true;
+              note(`P1B-INJECT session=${sid ?? '?'} turn=${turn ?? '?'} hit=${hitAt} via=${via} `
+                 + `atChar=${p.at} k24Before=${p.k24Before} observeN=${cfg.p1bObserveChars} `
                  + `dropPct=${cfg.p1bSuccessDropPct} —— 预注册参数已打印；`
                  + `⚠️ 基础率 2/6（本簇 6 段真循环有 2 段自愈）⇒ 单次结果只作记录、不作证据`);
-            } else {
-              note(`P1B-INJECT-SKIP session=${sid ?? '?'} turn=${turn ?? '?'} —— agent 无 steer（拿不到能力）`);
-            }
-          } catch (e) {
-            note(`P1B-INJECT-FAIL session=${sid ?? '?'} turn=${turn ?? '?'} ${String(e)}`);
+            }).catch((e) => {
+              note(`P1B-INJECT-FAIL session=${sid ?? '?'} turn=${turn ?? '?'} ${String(e).slice(0, 160)}`);
+            });
+          } else {
+            note(`P1B-INJECT-SKIP session=${sid ?? '?'} turn=${turn ?? '?'} —— agent 无 steer（拿不到能力）`);
           }
         }
         // v0.3.3 节流：同一 attempt 命中多次只记 1、6、11… 次（原实现一次命中写一行，
@@ -1026,21 +1115,12 @@ export const apply = (ctx, config) => {
         note(`EMPTY-TURN-STEER-SKIP session=${sid}（拿不到 Agent，或它没有 steer）`);
         return;
       }
-      // ⚠️ `@deepseek-ai/dsh-llm` 是 **dsh 内部包**；`link:` 装的插件不一定解析得到它
-      //    ⇒ 动态 import + 失败降级（失败只影响这一句补救，其它四条线照常）。
-      import('@deepseek-ai/dsh-llm').then(({ createUserMessage }) => {
-        try {
-          ag.steer(createUserMessage({
-            content: [{ type: 'text', text: cfg.emptyTurnHint }],
-            source: { kind: 'plugin', plugin: name },
-          }));
-          emptyTurnSteered.set(sid, used + 1);
-          note(`EMPTY-TURN-STEER session=${sid} turn=${st.turn}（第 ${used + 1}/${maxSteer} 次）`);
-        } catch (e) {
-          note(`EMPTY-TURN-STEER-FAIL session=${sid} ${String(e).slice(0, 160)}`);
-        }
+      // ⚠️ 与 ①c P1-b 共用 `steerHint()` —— 内部含动态 import + 失败降级。
+      steerHint(ag, cfg.emptyTurnHint, name).then((via) => {
+        emptyTurnSteered.set(sid, used + 1);
+        note(`EMPTY-TURN-STEER session=${sid} turn=${st.turn} via=${via}（第 ${used + 1}/${maxSteer} 次）`);
       }).catch((e) => {
-        note(`EMPTY-TURN-STEER-FAIL session=${sid}（import 失败：${String(e).slice(0, 120)}）`);
+        note(`EMPTY-TURN-STEER-FAIL session=${sid} ${String(e).slice(0, 160)}`);
       });
     } catch { /* 绝不影响会话事件链 */ }
   };
@@ -1279,6 +1359,17 @@ export const apply = (ctx, config) => {
   //     移除 = 删掉下面这几行 import（连同本段注释）。
   // ─────────────────────────────────────────────────────────────────────
   note(`loaded v${VERSION} probeMountPoint=optional —— exit-check.mjs 不在发布包内，不属于本项目功能，将来移除（见 README）`);
+  // ── 注入通路自检（v0.8.2）：`agent.steer` 只是"接口在"，**消息构造**还要拿到
+  //    `@deepseek-ai/dsh-llm` 的 `createUserMessage` —— 而它是 **dsh 内部包**，
+  //    `link:` 装的插件**未必在解析路径上够得着**（2026-10-07 实测：测试环境 ERR_MODULE_NOT_FOUND）。
+  //    ⇒ 这一行把结论直接写进日志（不必等一次真循环）；拿不到时会走**自建 UserMessage 兜底**
+  //    （见 `buildSteerMessage`），日志里用 `via=` 区分走了哪条路。
+  try {
+    const r = typeof import.meta.resolve === 'function' ? import.meta.resolve('@deepseek-ai/dsh-llm') : '(no import.meta.resolve)';
+    note(`STEER-RESOLVE ok ${String(r).slice(0, 120)}`);
+  } catch (e) {
+    note(`STEER-RESOLVE fail ${String(e).slice(0, 160)} ⇒ 注入将走自建 UserMessage 兜底（via=self-built）`);
+  }
   if (cfg.probeMount === true) {          // ← 默认 false：不开就不加载任何东西
     import('./exit-check.mjs')
       .then((m) => m.attach(ctx, cfg, { redactSecrets }))

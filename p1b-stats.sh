@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# p1b-stats.sh —— 聚合「注入能力」与「注入效果」，**出概率**（2026-10-07 定）
+#
+# 起因（原话）：「**先解决能不能注入**，之后才是误杀和有没有用 …… 误杀允许存在，
+#   注入可以没用，**概率是多少要统计出来**」
+# ⇒ 本脚本只做一件事：把 loop-fuse 日志里的 P1-b / ⑤ 线事件**累加成率**，
+#   并在样本不足时**明说不足**（不把 n=1 当结论）。
+#
+# 两段分开看（顺序不能颠倒）：
+#   ① 能不能注入 = CAPABILITY / INJECT 成功 vs SKIP/FAIL      ← **先看这段**
+#   ② 有没有用   = OBSERVE 的 verdict 分布 + ⑤ 线效果         ← 有样本了再看
+#
+# ⚠️ 为什么「先解决能不能注入」：注入路径有**两关** ——
+#   (a) `agent.steer` 在不在（`P1B-CAPABILITY`，任何一次 LLM 请求时就地探测）；
+#   (b) 构造消息要的 `@deepseek-ai/dsh-llm` 能不能解析（`STEER-RESOLVE`；解析不到时走
+#       **自建兜底**，日志里 `via=self-built`）。两关都过才有 `P1B-INJECT`。
+#
+# 用法：
+#   bash p1b-stats.sh                     # 用默认落点（按 DSH_HOME 派生）
+#   bash p1b-stats.sh /path/to/loop-fuse.log
+set -uo pipefail
+DEFAULT_LOG="${DSH_HOME:-$HOME/.dsh}/logs/dsh-local-loop-fuse/loop-fuse.log"
+LOG="${1:-$DEFAULT_LOG}"
+[ -f "$LOG" ] || { echo "❌ 日志不存在：$LOG"; exit 1; }
+
+c() { grep -ac -- "$1" "$LOG" 2>/dev/null | head -1; }
+pct() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b+0==0) printf "—"; else printf "%.0f%%", a*100/b }'; }
+line() { # $1 标签 $2 分子 $3 分母
+  local mark=""; [ "${3:-0}" -lt 5 ] && mark="   ⚠️ n<5 不足以下结论"
+  printf '   %-30s %4s/%-4s = %-5s%s\n' "$1" "$2" "${3:-0}" "$(pct "${2:-0}" "${3:-0}")" "$mark"
+}
+
+echo "════ 注入统计（$LOG）════"
+echo "更新时刻：$(stat -c %y "$LOG" 2>/dev/null | cut -c1-19) · 日志行数：$(wc -l < "$LOG")"
+echo
+echo "【① 能力层 —— 先解决这个】"
+# ⚠️ 正则必须**锚到 `steer=true cancel=`**（实测踩坑：那行日志的后半句说明文字里
+#   还含 `steer=false ⇒ …` ⇒ 宽正则会**在同一行上数两次**，报出假的 `1/2 = 50%` 与一条假 🚩。
+#   这正是本仓库反复出现的那族毛病：**判据比被检查的东西宽**。现在那半句已改成中文描述，
+#   但**锚定正则保留** —— 它才是真防线。）
+cap_y=$(c 'P1B-CAPABILITY .*steer=true cancel='); cap_n=$(c 'P1B-CAPABILITY .*steer=false cancel=')
+line 'steer 可用（会话数）' "$cap_y" "$((cap_y + cap_n))"
+[ "$cap_n" -gt 0 ] && echo "   🚩 有 $cap_n 个会话 steer 不可用 ⇒ P1-b 与 ⑤ 线**都注入不了**（先解决这层，不是调参）"
+# 第二关：构造消息要 `@deepseek-ai/dsh-llm`（dsh 内部包）—— `link:` 插件未必解析得到
+rs_y=$(c 'STEER-RESOLVE ok'); rs_n=$(c 'STEER-RESOLVE fail')
+printf '   %-30s %s\n' '注入通路 · 解析成功（进程数）' "$rs_y"
+[ "$rs_n" -gt 0 ] && echo "   ⚠️ 有 $rs_n 个进程只用**自建兜底**（解析不到 @deepseek-ai/dsh-llm ⇒ via=self-built）"
+echo
+echo "【② 注入层 —— P1-b（① 线命中触发）】"
+ij=$(c 'P1B-INJECT session'); isk=$(c 'P1B-INJECT-SKIP'); ifa=$(c 'P1B-INJECT-FAIL')
+line 'P1-b 注入成功' "$ij" "$((ij + isk + ifa))"
+line '  └ SKIP（拿不到能力）' "$isk" "$((ij + isk + ifa))"
+line '  └ FAIL（抛错）' "$ifa" "$((ij + isk + ifa))"
+line '  └ 其中 via=dsh-llm' "$(c 'P1B-INJECT .*via=dsh-llm')" "$ij"
+line '  └ 其中 via=self-built' "$(c 'P1B-INJECT .*via=self-built')" "$ij"
+echo
+echo "【③ 效果层 —— 注入后观测（双读数）】"
+v_ok=$(c 'P1B-OBSERVE.*verdict=有效'); v_no=$(c 'P1B-OBSERVE.*verdict=无效'); v_un=$(c 'P1B-OBSERVE.*verdict=不确定')
+line '有效（k24 降 & 注入后不再循环）' "$v_ok" "$((v_ok + v_no + v_un))"
+line '无效（注入后仍循环）' "$v_no" "$((v_ok + v_no + v_un))"
+line '不确定' "$v_un" "$((v_ok + v_no + v_un))"
+echo "   📌 对照基线：本簇真循环的**基础自愈率 = 2/6 ≈ 33%**（307/308 自愈 · 309/311/313 被按停）"
+echo "      ⇒ 注入有效率**必须与它比**；单次有效不作证据。"
+echo
+echo "【④ ⑤ 线（零正文 turn）—— 同一 steer API】"
+e_ok=$(c 'EMPTY-TURN-STEER session'); e_sk=$(c 'EMPTY-TURN-STEER-SKIP'); e_fa=$(c 'EMPTY-TURN-STEER-FAIL')
+line '⑤ 线 steer 成功' "$e_ok" "$((e_ok + e_sk + e_fa))"
+line '  └ SKIP / FAIL' "$((e_sk + e_fa))" "$((e_ok + e_sk + e_fa))"
+echo
+echo "【⑤ 检测层（仅计数，不作结论）】"
+printf '   %-30s %s\n' '① 线 DETECT 行' "$(c 'DETECT attempt')"
+printf '   %-30s %s\n' '① 线 STRIKE-PENDING 行' "$(c 'STRIKE-PENDING')"
+printf '   %-30s %s\n' '③ 线真掐断 ABORT-VIA-CANCEL' "$(c 'ABORT-VIA-CANCEL')"
+printf '   %-30s %s\n' 'EMPTY-TURN 记录（含旧 log 期）' "$(c 'EMPTY-TURN session')"

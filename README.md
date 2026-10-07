@@ -145,11 +145,28 @@ grep -n "loop-fuse" <DSH_HOME>/profiles/web/package.json
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `enabled` | `true` | 总开关；`false` 时 `apply()` 直接返回 |
-| `dryRun` | `false` | `false` = 命中即**掐断**（走 `agent.cancel`，v0.3.3 **已上膛**）；`true` = 只记日志 |
+| `probeMount` | `false` | **可选挂载点**：`true` 时 `index.js` 末尾会 import 一个**本地文件**（作者本机用它挂实验探针）。默认关闭 ⇒ 本包默认**不加载任何本地文件**；见文末「关于 `index.js` 末尾的可选挂载点」 |
+| `dryRun` | `false` | `false` = 命中即**掐断**（走 `agent.cancel`，v0.3.3 **已上膛**）；`true` = 只记日志。⚠️ ①c 的**注入**不受它控制（注入看 `p1bEnabled`）——「先注入、后掐断」是两条独立的动作 |
 | `minChars` | `2000` | 累计输出达此长度才**开始**检测（保护正常短回答） |
 | `window` | `600` | 比对用的特征窗口（字符），取缓冲区**末尾** `window` 个字符（2026-09-30 降敏：300→600）|
 | `history` | `4000` | 回溯范围（字符），在末尾之前这段里数重复次数 |
 | `repeats` | `3` | 同一窗口在回溯范围内出现 ≥ 此数 ⇒ 判定循环（tail 自身算 1 次） |
+| `textStrikesBeforeCancel` | `2` | **① 线命中达几次才真掐断**（2026-09-30 降敏：首次命中只 `STRIKE-PENDING`，第二次才掐）|
+| `lowDivDetect` | `true` | **①b 总开关**（`false` = 退回只有 ① 线精确匹配的行为）|
+| `lowDivWindow` | `2000` | ①b 末窗口径：统计窗口（字符，取末尾）|
+| `lowDivNgram` | `24` | ①b/①c 共用的片段长度（字符）|
+| `lowDivMaxUniq` | `45` | ①b 末窗内**唯一字符数**上限（低于它才算"用词贫乏"）|
+| `lowDivMinRepeat` | `10` | ①b 同一 `lowDivNgram` 片段在**末窗**内出现次数下限 |
+| `lowDivSlideDetect` | `true` | **①b-2 滑窗支总开关**（`false` = 退回只有末窗口径 ⇒ 局部循环永远漏）|
+| `lowDivSlideWin` | `400` | 滑窗窗口（字符）|
+| `lowDivSlideStep` | `100` | 滑窗步长（字符）；**末尾不足一步时额外补一个「以 buf 末尾结尾」的窗**（尾部补偿，见下）|
+| `lowDivSlideUniq` | `30` | 滑窗内唯一字符数上限。⚠️ **不能沿用末窗的 45**（滑窗 400 下 45 误报 17%）|
+| `lowDivSlideMinRepeat` | `3` | 滑窗内 k-gram 重复次数下限（**窗口内**计算，不跨窗）。曾取 2，2026-10-07 实测 `2→3` 免费（召回仍 5/5）⇒ 取 3 换误报余量 |
+| `p1bEnabled` | `false`（作者本机显式 `true`）| **①c 总开关**：① 线命中时向 agent 注入一句「停止推理」提示（见 v0.8.2 ①c 节）。⚠️ 默认 `false` 是**刻意**的：它替使用者自动发消息 |
+| `p1bInjectAtHit` | `1` | **预注册**：第几次 ① 线命中后注入（1 = 首次命中即注入）|
+| `p1bObserveChars` | `2000` | **预注册 N**：注入后再观察多少字符才出观测结论 |
+| `p1bSuccessDropPct` | `50` | **预注册成功阈值**：`k24` 降到 ≤ 注入前的 50% **且** ① 线不再命中 ⇒ 判"有效" |
+| `p1bHint` | （见 `DEFAULTS`）| 注入的提示文本（⚠️ 会作为**用户消息**进入会话，等同替使用者发话）|
 | `checkEvery` | `200` | 每新增这么多字符检查一次 |
 | `abortViaCancel` | `true` | **① 线真掐断的主路径**：调 `agent.cancel({kind:'hook',reason})`（v0.3.3 新增，见下节「为什么不能 `signal.abort()`」）|
 | `cancelKeepInbox` | `true` | 掐断时**保留排队消息** —— 只终止这场跑飞的 turn，不牵连用户排队输入（v0.3.3 新增）|
@@ -162,6 +179,11 @@ grep -n "loop-fuse" <DSH_HOME>/profiles/web/package.json
 | `repeatCallLimit` | `6` | **②b 线（v0.5.0）**：连续 N 次 `(tool + arguments)` **完全相同** ⇒ 判循环 |
 | `repeatCallCancel` | `true` | ②b 线是否**立即掐**（`false` = 只记 strike，交给③线累计）|
 | `repeatCallExemptTools` | `job_output, job_list` | **合法轮询豁免**：等后台任务时本就会连调同参 |
+| `emptyTurnDetect` | `true` | **⑤ 线总开关**：整个 turn 只有思考、正文一个字都没有 ⇒ 检出（判别式只看**结构**，不落思考正文）|
+| `emptyTurnLimit` | `1` | 同一会话**连续** N 个零正文 turn 才触发（中间有正常 turn 即归零）|
+| `emptyTurnAction` | `'steer'` | `'log'` = 只记日志 + 落结构样本；**`'steer'` = 另自动补一句「你没输出正文」提示**（2026-10-07 上膛）|
+| `emptyTurnSteerMax` | `3` | `action='steer'` 时**每会话**最多补救几次（防"补救本身变成新循环"）|
+| `emptyTurnHint` | （见 `DEFAULTS`）| ⑤ 线注入的提示文本 |
 | `watchIntervalSec` | `60` | 行动层定时扫描间隔（秒） |
 | `strikesBeforeCancel` | `2` | **③ 累积止损**：同一会话**窗口内**强信号达此数 ⇒ **真切断**（v0.3 新增；v0.4.0 起**只收强信号**）|
 | `strikeWindowMinutes` | `120` | strike 时效窗口 —— 超过此时长的旧 strike **不计入**（v0.3.1 新增） |
@@ -200,12 +222,16 @@ v0.8.2 起，① 线由**互补判据**组成，任一命中即算：
 ❌ 盲区：只看末尾 2000 字符 ⇒ **"正常推理里夹一段空转"会被正常部分的词汇稀释而漏掉**。
 
 **(c) 低多样性高重复 · 滑窗口径（`isLowDivSliding`，2026-10-07 加）**
-**滑窗**（窗 `lowDivSlideWin`(400) · 步 `lowDivSlideStep`(100)）扫全文，**任一窗口**同时满足：
-① 唯一字符数 < `lowDivSlideUniq`(30)；② 该窗内 k-gram(24) 重复 ≥ `lowDivSlideMinRepeat`(**2**)。
+**滑窗**（窗 `lowDivSlideWin`(400) · 步 `lowDivSlideStep`(100) · **末尾不足一步时补一个以 buf 末尾结尾的窗**）扫全文，**任一窗口**同时满足：
+① 唯一字符数 < `lowDivSlideUniq`(30)；② 该窗内 k-gram(24) 重复 ≥ `lowDivSlideMinRepeat`(**3**)。
 ✅ 抓 (b) 抓不到的「**局部循环 + 整段词汇丰富**」（真实事故 `seq 14872`：整段 `uniq=247`，
 滑窗最小 `29`）。
-⚠️ **② 的门槛必须低（2）**：局部循环每轮夹噪声，窗内 `k24` 实测真循环 `2/3/3/5/9` vs
-**模板化列表 `1`** ⇒ 2 恰好分开。**别再抬高**（会漏真循环）。
+⚠️ **② 的门槛必须低**：局部循环每轮夹噪声，窗内 `k24` 实测真循环 `2/3/3/5/9` vs
+**模板化列表 `1`** ⇒ 2 就能分开；实测 `2→3` 免费（召回仍 5/5）⇒ **取 3 换一档误报余量**，
+但**别再抬高**（真悬崖在 4，会漏 `14872`）。
+⚠️ **尾部补偿（2026-10-07 加）**：步进窗的最后一个终点是 `win + n*step`，因此**最后 `< step`
+个字符从不属于任何窗**；与 `checkEvery:200` 叠加可造成最多 ~99 字符的**检测延迟**
+（不是漏报，是延迟）⇒ 额外补一个以 `buf` 末尾结尾的窗（拾遗 round2 §1.6 实测）。
 ⚠️ **(b) 与 (c) 的阈值必须各自配套、不可互换**：末窗(2000) 下 45 可用；
 **滑窗(400) 下 45 误报 850/5,013 块（17%）**，滑窗需 `<30`。
 开关：`lowDivDetect: false` 关整条 ①b；`lowDivSlideDetect: false` 只关滑窗支。
@@ -418,10 +444,14 @@ tail -20 "$DSH_HOME/logs/dsh-local-loop-fuse/loop-fuse.log"
 
 ```bash
 cd <plugin-dir>/
-node test-islooping.mjs   # 20/20 · 纯函数：重复判定 + checkStall 阈值 + 调用指纹
-node test-abort.mjs       # 12/12 · 集成：① 线"检测 ⇒ 真 cancel"（v0.3.3 新增，回归本次两层 bug）
-node test-cancel.mjs      # 13/13 · 集成：③ 线 strike ⇒ cancel（约 35 s）
-node test-dump.mjs        # 42/42 · v0.6.0 ④线：脱敏 / 取证切片 / 三条线落盘 / 去重 / 禁名单守卫 / 上限（约 8 s）
+bash run-tests.sh          # 推荐：跑全部 + 机械校验 samples/ 未被污染（约 1 min）
+
+node test-islooping.mjs    # 28/28 · 纯函数：重复判定（含 ①b/①b-2）+ checkStall 阈值 + 调用指纹
+node test-abort.mjs        # 12/12 · 集成：① 线"检测 ⇒ 真 cancel"（v0.3.3 新增，回归本次两层 bug）
+node test-cancel.mjs       # 14/14 · 集成：③ 线 strike ⇒ cancel（约 35 s）
+node test-dump.mjs         # 42/42 · v0.6.0 ④线：脱敏 / 取证切片 / 三条线落盘 / 去重 / 禁名单守卫 / 上限（约 8 s）
+node test-empty-turn.mjs   # 19/19 · v0.8.0 ⑤线：零正文判据 + 上膛路径（约 1 s）
+node test-p1b.mjs          # 16/16 · v0.8.2 ①c：注入 / 预注册观测 / 能力自检 / 只注入一次（约 3 s）
 ```
 
 ⚠️ **写集成测试时务必 `dumpSamples: false`**（或把 `dumpDir` 指到临时目录）——
@@ -447,6 +477,11 @@ node test-dump.mjs        # 42/42 · v0.6.0 ④线：脱敏 / 取证切片 / 三
 
 ## 状态与后续
 
+- **v0.8.2（2026-10-07 · 待发布）**：①b 末窗支 + ①b-2 滑窗支（尾部补偿）+ ①c P1-b 注入与观测 +
+  能力自检 + 三个测试抓到的 bug（见上）。**测试 131 项全绿**
+  （islooping 28 · abort 12 · cancel 14 · dump 42 · empty-turn 19 · p1b 16 · `samples/` 未污染）。
+  ⚠️ **重启 dsh 后必核三行**：`STEER-RESOLVE …` → `P1B-CAPABILITY …` → 真命中时的 `P1B-INJECT … via=…`；
+  其中**自建兜底（`via=self-built`）能否被 dsh 正常消费仍是【待验证】**。
 - **v0.3.3（2026-09-29 夜）**：① 线"检测有效但掐不死"的**两层 bug 已修 + 有回归测试**
   （`test-abort.mjs` 12/12）；**① 线已上膛 `dryRun=false`** —— **重启 dsh 后生效**。
 - 生效判据：`loaded … dryRun=false … abortViaCancel=true cancelKeepInbox=true`。
@@ -486,7 +521,7 @@ Cannot destructure property 'reasoningEffort' of 'resolved' as it is undefined
 
 ---
 
-## v0.8.2 改造记录（2026-10-07 · **① 线抓不到「带噪声的交替空转」**）
+## v0.8.2 改造记录（2026-10-07 · **① 线结构性漏报 · ①c 注入 · 三个"测试才看得见"的 bug**）
 
 **触发（有目击者的真实事故）**：本机 1.5 上，白露在 reasoning 里空转三次
 （`（停）→（调用）→（结束）→（停）…` 反复铺满，偶尔插 `d`），**护栏三次都没有任何反应**
@@ -552,7 +587,8 @@ empty-turn 19/19，`samples/` 未被污染）。
 |---|---|---|
 | `lowDivSlideWin` / `lowDivSlideStep` | 400 / 100 | 实测 `seq 14872` 滑窗最小 `uniq=29` |
 | `lowDivSlideUniq` | **30** | ⚠️ **不是 45** —— 滑窗(400) 下 45 误报 **850/5,013 块（17%）**，30 才回到可用区。**阈值必须与口径配套** |
-| `lowDivSlideMinRepeat` | **2** | **测试逼出来的**：同一窗口内 `k24` 真循环 `2/3/3/5/9` vs **模板列表 `1`** |
+| `lowDivSlideMinRepeat` | **3** | **测试逼出来的**：同一窗口内 `k24` 真循环 `2/3/3/5/9` vs **模板列表 `1`**；拾遗 round2 实测 `2→3` **免费**（召回仍 5/5）⇒ 取 3 换一档误报余量（真悬崖在 4）|
+| `lowDivSlideStep` 的**尾部补偿** | 补一个以缓冲区末尾结尾的窗 | 步进窗的最后一个终点是 `win + n*step` ⇒ **最后 `< step` 个字符从不属于任何窗**；与 `checkEvery:200` 叠加最多 ~99 字符**检测延迟**（是延迟、不是漏报）|
 
 **全量验证【实测】**（160 会话 · **5,025** 长文本块，**直接用生产代码**跑、非复刻）：
 
@@ -563,6 +599,73 @@ empty-turn 19/19，`samples/` 未被污染）。
 **测试**：新增 **⑧ / ⑧b**：合成「局部循环」样本，⑧b 断言「**关掉滑窗支必须 `false`**」
 ⇒ 防「改回只有末窗的版本还显示全绿」。
 📌 本支 ② 的门槛是**测试逼出来的**：初版「只看 `uniq`」时，`④b 模板化列表` 被判 `true`（**误杀**）。
+
+### 🔴 当日追加③：①c P1-b —— ① 线命中时**注入「停止」类词**（2026-10-07 定「加」）
+
+**它是什么**：① 线命中达 `p1bInjectAtHit`(1) 次时，用 `agent.steer()` 往会话里注入 `p1bHint`
+（一句「你在原地重复 ⇒ 停止推理、直接给结论」）。**注入是温和动作，先于掐断**：掐断仍按
+`textStrikesBeforeCancel` 走，两者互相独立（`dryRun: true` 只停掐断、不停注入，见配置项表）。
+
+**为什么要"按能出结论的方式"加**（本项争议过，结论必须落在判据上）：
+一方判"不该做"（有样本显示注入后仍循环）；复核方判"证伪不成立"（那两例**结构上碰不到注入通路**
+—— ① 线命中走的是 `cancel`、⑤ 线判据要求零正文），但她用另一段样本**加强了方向**
+（使用者**亲自发的「停」已送达** + 模型逐字引用规则，随后仍循环 ~100 行）。
+⇒ 结论：**可以加，但必须先让它可被证伪**。四条设计（逐条对应上面的反对意见）：
+
+| 设计 | 做法 | 为什么 |
+|---|---|---|
+| **预注册** | `p1bInjectAtHit` / `p1bObserveChars` / `p1bSuccessDropPct` 全部配置化，**并在注入行里打印** | 没有预注册 ⇒ 事后总能挑一个好看的口径 |
+| **双读数** | ① `k24Max`（窗口内 24-gram 最高重复）② `isLooping`（注入后 ① 线是否仍命中）| 单臂前后测**没有反事实** |
+| **不数「停」字** | 读数用结构量 `k24`，**不统计「停」字密度** | 注入文本**自己含"停"字**，被模型抄回后**只抬高处理臂**的密度 ⇒ 不对称偏差 |
+| **基础率对照** | 日志与统计脚本都写明**基础自愈率 2/6 ≈ 33%** | 单次"注入后它停了"不算证据 |
+
+**观测判据**（`P1B-OBSERVE`）：`k24` 降到 ≤ `(1-dropPct)` **且** 读数 2 为"不再循环" ⇒ `有效`；
+**仍循环** ⇒ `无效`；其余（含观察量不足）⇒ `不确定`。每行都带基础率提醒。
+⚠️ **读数 2 的口径 = 注入之后新增的那一段**（不是整个缓冲区）—— 见下面「测试抓到的三个 bug」。
+
+**能力自检**（`P1B-CAPABILITY`）：注入依赖 `agent.steer`，而它"能不能用"原先**只能等一次真循环**
+才知道（当天是 0 次触发 ⇒ 等于没法验证）。现在**任何一次 LLM 请求**时就地探测、每会话只打一行：
+`P1B-CAPABILITY session=… steer=<bool> cancel=<bool> inbox=<type>`。
+它只回答「**能力在不在**」，**不回答**「注入有没有用」—— 后者要真循环 + 观测，两者别混。
+
+> ⚠️ **这一行是机器可读行**：`steer=<bool> cancel=<bool>` 的格式必须保持，且**说明文字里不能再出现
+> 布尔字面量** —— 首版写了 `steer=false ⇒ …`，统计脚本的宽正则在**同一行上数了两次**，报出假的
+> `1/2 = 50%` 与一条假 🚩。这正是本仓库反复出现的那族毛病：**判据比被检查的东西宽**。
+
+**注入通路本身也有坑（v0.8.2 写测试时抓到）**：`agent.steer()` 要一条 **UserMessage**，
+官方构造器 `createUserMessage` 在 **dsh 内部包** `@deepseek-ai/dsh-llm` 里 ——
+而 `link:` 装的插件**在解析路径上够不着它**（实测 `ERR_MODULE_NOT_FOUND`）。
+⇒ 现在按优先级两条路（`buildSteerMessage()`），日志用 `via=` 区分：
+`via=dsh-llm`（官方构造器）· `via=self-built`（**自建兜底**：`{id, role, content, source}` + 深冻结）。
+⚠️ 自建兜底能否被 dsh 正常消费 = **【待验证】**（需重启 dsh 后在真实会话里看语义是否正常）。
+
+**把概率统计出来**（`p1b-stats.sh`，仓库根 · **不在 npm 包里**）：
+```bash
+bash p1b-stats.sh                      # 默认读 ${DSH_HOME}/logs/dsh-local-loop-fuse/loop-fuse.log
+bash p1b-stats.sh /path/to/loop-fuse.log
+```
+分两段、**顺序不能颠倒**：① **能力层**（`CAPABILITY` / `INJECT` 成功 vs SKIP/FAIL）→
+② **效果层**（`OBSERVE` 的 verdict 分布）。`n<5` 一律标「不足以下结论」。
+
+**发布默认值**：`p1bEnabled` **默认 `false`** —— 本项会**替使用者自动发消息**
+（以用户身份注入一句话），与 0.8.1 的 `probeMount` 同一套做法：**默认可移植/保守 + 本机覆盖**。
+要用的人自行在 `cordis.patch.yml` 里打开；作者本机就是显式 `p1bEnabled: true`。
+
+**生效方式**：`link:` + ESM 缓存 ⇒ 改完**必须重启 dsh**；重启后核对三行：
+`STEER-RESOLVE …`（解析成败）· `P1B-CAPABILITY …`（能力在不在）· 真命中时的 `P1B-INJECT … via=…`。
+
+### 🐞 v0.8.2 测试抓到的三个 bug（都是"不写测试就看不见"的那类）
+
+`test-p1b.mjs`（16/16）是本节的防线。写它的过程中当场抓到三个缺陷，都已修：
+
+| # | 缺陷 | 为什么危险 | 修法 |
+|---|---|---|---|
+| 1 | **`createUserMessage` 从未 import** | ①c 每次注入都 `ReferenceError` ⇒ **P1-b 上线即失效**（能力自检却显示"steer 可用"） | 抽 `buildSteerMessage()` 统一构造（含自建兜底），两条注入路径共用 |
+| 2 | **观测读数 2 口径过宽** | 用**整个缓冲区**调 `isLooping`，而注入点之前那段循环**永久留在缓冲区里** ⇒ `line1StillHits` **恒为 true** ⇒ verdict 永远"无效"，观测等于白做 | 只对**注入点之后**的片段判定（`buf.slice(p.at)`）|
+| 3 | **会二次注入** | 观测结束把 `st.p1b` 置回 `null`，命中持续时条件又成立 ⇒ 同一 attempt **反复注入**（注释写着"只注入一次"，代码做不到）| 加持久标记 `p1bDone`：**每 attempt 最多尝试注入一次**（SKIP/FAIL 也算尝试过）|
+
+📌 ⑦ 用例还固化了一条容易被忽略的事实：**① 线的精确子串判据不接受重叠命中** ⇒
+周期文本要长到"末尾窗口里有 ≥2 个不重叠接缝"才判得出来（实测量级 ~4.6k 字符）。
 
 ## v0.8.1 改造记录（2026-10-05 · **指纹只认「动作」**）
 
