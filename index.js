@@ -154,7 +154,32 @@ export const DEFAULTS = {
   // ⚠️ 滑窗支的 ② 条件门槛**非常低**（2，不是末窗支的 10）—— 由测试 `④b 模板化列表` 逼出来：
   //   在「min-uniq 窗口」内实测 k24：真循环 `2/3/3/5/9` vs **模板列表 `1`**
   //   ⇒ 门槛取 2 就能挡住模板列表、又不漏真循环。**别再抬高**（会漏 `14872`/`14922`）。
-  lowDivSlideMinRepeat: 2,   // 滑窗内 k-gram 重复次数下限（窗口内计算，不跨窗）
+  lowDivSlideMinRepeat: 3,   // 滑窗内 k-gram 重复次数下限（窗口内计算，不跨窗）
+  // 🔄 2026-10-07 拾遗 round2 实测后 2 → **3**：她扫过 1/2/3/4 ——
+  //   `2→3` 是**免费**的（召回仍 5/5，只在一个样本上多 600 字符延迟），真悬崖在 4（漏 14872）。
+  //   我方复测（含尾部补偿窗）仍 5/5。⇒ 取 3 换一档误报余量。
+  // ⚠️ 她另建议改判据为「**窗内 distinct 重复 24-gram ≥ 3**」（对 ④b 形态更稳：④b 恒 0）。
+  //   我方在**全库 5,076 块**实测：现状(maxRep≥2) 与 distinct≥3 的命中集**完全相同（16/16）**，
+  //   distinct≥5 仅少 2 块 ⇒ **换过去没有实测收益** ⇒ **暂不换**，记为候选（本轮实测口径见
+  //   `07-experiments/2026-10-07-loopfuse-round2-round1.md` 与我方复算）。
+  // ── ①c P1-b：① 线命中时**注入「停止」类词** + **预注册观测**（2026-10-07 机主定「加」）──
+  // 背景与争议：机主要"加"（"2 次脱困是实打实的 · 一切等实测数据"）；拾遗 round2 判"不该做"
+  //   （seq14900 全文 9 处「停止」仍失败）；烛微 round6 判：**机主的证伪不成立**（那 2 例
+  //   结构上碰不到注入通路 —— ① 线命中走 cancel、⑤ 线判据要求零正文）**且拾遗 over-claim**
+  //   （"非充分"≠"注入无效"），**但她用 seq14911 加强了方向**（机主**亲自发的「停」已送达** +
+  //   模型逐字引用规则，随后仍循环 ~100 行）。
+  // ⇒ 结论：**可以加，但必须按"能出结论"的方式加**（烛微四条，逐条对应下面的设计）：
+  //   ① 单臂前后测无反事实 ⇒ 除密度外，**另记「注入后 ① 线是否仍命中」作独立读数**；
+  //   ② 度量污染（注入文本含"停"字、恰在碎片族里）⇒ 读数用 **k24 最高重复**，**不数"停"字**；
+  //   ③ 无预注册 ⇒ 注入点 / N / 成功阈值**全部配置化并在日志里打印**；
+  //   ④ **基础率 2/6**（本簇 6 段真循环有 2 段自愈）⇒ 单次"注入后它停了"**不算证据**，日志明记。
+  // ⚠️ 本项**会替机主自动发消息**（同 ⑤ 线 steer 一类动作）；发布包里应默认 false。
+  p1bEnabled: true,          // 总开关
+  p1bInjectAtHit: 1,         // **预注册**：第几次 ① 线命中后注入（1 = 首次命中即注入）
+  p1bObserveChars: 2000,     // **预注册 N**：注入后再观察这么多字符才判
+  p1bSuccessDropPct: 50,     // **预注册成功阈值**：k24 降到 ≤ 注入前的 50% **且** ① 线不再命中
+  p1bHint: '⚠️ 系统提示（dsh-local-loop-fuse）：检测到你在**原地重复**。请**停止推理，直接输出结论**，'
+    + '或直接调用你要调用的工具。不要继续复述同一串词。',
   textStrikesBeforeCancel: 2, // ① 线：**命中达此次数才掐断**（2026-09-30 新增；此前首次命中即掐）
   checkEvery: 200,   // 每新增这么多字符检查一次
   signalMaxAgeMinutes: 10, // 保存的 AbortSignal 超过此时长视为陈旧 ⇒ 不 abort（防御性，见 v0.3.3）
@@ -336,7 +361,13 @@ function isLowDivSliding(buf, cfg) {
   const k = cfg.lowDivNgram ?? 24;
   const minRepeat = cfg.lowDivSlideMinRepeat ?? 2;
   if (buf.length < win) return false;
-  for (let end = win; end <= buf.length; end += step) {
+  // ⚠️ **尾部补偿**（拾遗 round2 §1.6 实测）：步进窗的最后一个终点是 `win + n*step`，
+  //    因此**最后 `< step` 个字符从不属于任何窗**；与 `checkEvery:200` 叠加可造成最多 ~99 字符
+  //    的检测延迟（不是漏报，是延迟）。⇒ 额外补一个**以 buf 末尾结尾**的窗。
+  const ends = [];
+  for (let end = win; end <= buf.length; end += step) ends.push(end);
+  if (ends[ends.length - 1] !== buf.length) ends.push(buf.length);
+  for (const end of ends) {
     const seg = buf.slice(end - win, end);
     if (new Set(seg).size >= maxUniq) continue;      // ① 该窗口用词够丰富 ⇒ 跳过
     const seen = new Map();                          // ② **该窗口内** k-gram 重复 ≥ minRepeat
@@ -348,6 +379,25 @@ function isLowDivSliding(buf, cfg) {
     }
   }
   return false;
+}
+
+/**
+ * P1-b 观测读数：窗口内 **24-gram 最高重复次数**（`k24Max`）。
+ *
+ * ⚠️ 为什么读数不用"碎片/「停」字密度"（烛微 round6 §2.1 第 2 条）：**注入文本本身含"停"字**，
+ *    一旦被模型抄回 reasoning（已实测会发生），**只有处理臂的密度会被抬高** ⇒ 不对称偏差，
+ *    可能把"有效"读成"无效"、也可能反向。⇒ 读数改用**结构量 k24**，它不数任何特定字。
+ */
+export function k24Max(s, k = 24) {
+  const m = new Map();
+  let best = 0;
+  for (let i = 0; i + k <= s.length; i++) {
+    const g = s.slice(i, i + k);
+    const v = (m.get(g) ?? 0) + 1;
+    if (v > best) best = v;
+    m.set(g, v);
+  }
+  return best;
 }
 
 /**
@@ -769,6 +819,23 @@ export const apply = (ctx, config) => {
     if (c.text) st.buf += c.text;
     st.kind = c.type;
 
+    // ── ①c P1-b 观测：注入后累计到 N 字符 ⇒ 出结论（**双读数**，烛微 round6 §2.1 要求）──
+    // 读数 1 = k24（结构量，不数"停"字 ⇒ 避开注入文本自身的度量污染）
+    // 读数 2 = isLooping（**独立**：注入后 ① 线是否仍命中）
+    // 预注册判据：k24 降到 ≤ (1-dropPct) **且** ① 线不再命中 ⇒ 有效；仍命中 ⇒ 无效；其余 ⇒ 不确定
+    if (st.p1b && st.buf.length >= st.p1b.until) {
+      const p = st.p1b; st.p1b = null;
+      const k24After = k24Max(st.buf.slice(-cfg.p1bObserveChars));
+      const still = isLooping(st.buf, cfg);
+      const drop = p.k24Before > 0 ? Math.round((1 - k24After / p.k24Before) * 100) : 0;
+      const ok = p.k24Before > 0
+        && k24After <= p.k24Before * (1 - cfg.p1bSuccessDropPct / 100) && !still;
+      note(`P1B-OBSERVE session=${agent?.session?.id ?? '?'} turn=${turnOfAttempt(frame.attemptId) ?? '?'} `
+         + `N=${cfg.p1bObserveChars} k24Before=${p.k24Before} k24After=${k24After} drop=${drop}% `
+         + `line1StillHits=${still} injected=${p.injected} verdict=${ok ? '有效' : (still ? '无效' : '不确定')} `
+         + `—— ⚠️ 基础率 2/6 ⇒ 单次只作记录、不作结论`);
+    }
+
     if (st.buf.length >= st.nextCheck) {
       st.nextCheck = st.buf.length + cfg.checkEvery;
       if (isLooping(st.buf, cfg)) {
@@ -779,6 +846,32 @@ export const apply = (ctx, config) => {
         const rec = signals.get(agent);
         const sig = rec?.signal;
         const stale = !rec || (Date.now() - rec.at > cfg.signalMaxAgeMinutes * 60000);
+        // ── ①c P1-b：首次命中时注入「停止」类词（**带预注册观测**；见 DEFAULTS 里的长注释）──
+        // ⚠️ 与 ⑤ 线**共用 `agent.steer`**（同一 API、另一个触发条件）；**每 attempt 只注入一次**。
+        // ⚠️ 本动作**替机主自动发消息** ⇒ 失败/拿不到能力时必须留痕（SKIP/FAIL），不许静默。
+        if (cfg.p1bEnabled !== false && !st.p1b && st.hits >= (cfg.p1bInjectAtHit ?? 1)) {
+          const win = Math.min(st.buf.length, cfg.p1bObserveChars);
+          st.p1b = {
+            at: st.buf.length,
+            until: st.buf.length + cfg.p1bObserveChars,
+            k24Before: k24Max(st.buf.slice(-win)),
+            injected: false,
+          };
+          try {
+            if (agent && typeof agent.steer === 'function') {
+              agent.steer(createUserMessage({ content: [{ type: 'text', text: cfg.p1bHint }] }));
+              st.p1b.injected = true;
+              note(`P1B-INJECT session=${sid ?? '?'} turn=${turn ?? '?'} hit=${st.hits} `
+                 + `atChar=${st.p1b.at} k24Before=${st.p1b.k24Before} observeN=${cfg.p1bObserveChars} `
+                 + `dropPct=${cfg.p1bSuccessDropPct} —— 预注册参数已打印；`
+                 + `⚠️ 基础率 2/6（本簇 6 段真循环有 2 段自愈）⇒ 单次结果只作记录、不作证据`);
+            } else {
+              note(`P1B-INJECT-SKIP session=${sid ?? '?'} turn=${turn ?? '?'} —— agent 无 steer（拿不到能力）`);
+            }
+          } catch (e) {
+            note(`P1B-INJECT-FAIL session=${sid ?? '?'} turn=${turn ?? '?'} ${String(e)}`);
+          }
+        }
         // v0.3.3 节流：同一 attempt 命中多次只记 1、6、11… 次（原实现一次命中写一行，
         //   实测同一 attempt 写了 6 行 `hits=1→6`）。
         if (st.hits % 5 === 1) {
