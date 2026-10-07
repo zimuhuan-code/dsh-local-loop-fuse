@@ -1002,7 +1002,10 @@ export const apply = (ctx, config) => {
     // v0.4.0-A：**流式吐字也算"有进展"** —— 否则"长时间生成一大段文本"会被误判停滞。
     try {
       const sid = agent?.session?.id ?? agent?.session?.header?.id;
-      const turn = frame.turn ?? lastTurnByAgent.get(agent);
+      // ⚠️ 2026-10-07（第 5 轮审阅 §2）：**顺序必须是**「先查表、再兜底 frame.turn」——
+      //   本模块 frame 上并没有 turn（注释见 v0.8.2 记录），此时 frame.turn 恒 undefined；
+      //   写成 `frame.turn ??` 会让「以表为准」这个意图读起来是反的。
+      const turn = lastTurnByAgent.get(agent) ?? frame.turn;
       if (sid && turn != null) {
         const t = turns.get(`${sid}#${turn}`);
         if (t) t.lastProgressAt = Date.now();
@@ -1100,6 +1103,9 @@ export const apply = (ctx, config) => {
                   { keepInbox: cfg.cancelKeepInbox },
                 );
                 st.canceled = true;
+                // ⚠️ 2026-10-07（第 5 轮审阅 §1）：这条掐断**也要进 strike 池** —— 否则
+                //   「额度用尽 ⇒ 掐断」在归因统计里是隐形的（池恒为 0，事后查不出是谁掐的）。
+                if (sid) recordStrike(sid, 'p1b-quota', { turn: realTurn ?? null });
                 note(`P1B-QUOTA-CANCEL session=${sid ?? '?'} attempt=${frame.attemptId} `
                    + `episode=${ep.count}/${epMax} lifetime=${lifeUsed}/${hardMax} `
                    + `keepInbox=${cfg.cancelKeepInbox} ← 额度用尽且仍命中，已掐断`);
@@ -1306,9 +1312,12 @@ export const apply = (ctx, config) => {
         return;
       }
       // ⚠️ 与 ①c P1-b 共用 `steerHint()` —— 内部含动态 import + 失败降级。
+      // ⚠️ 2026-10-07（第 5 轮审阅 §1）：**先同步预扣、再注入** —— 与 ①c 的口径对齐
+      //   （原来只在 `.then` 里加计数：注入未落地期间若并发命中会重复放行；且 ①c 预扣、
+      //   ⑤线后扣，同一原则两处不对称）。**失败也占额度**，与 ①c 的「FAIL 占额度」同义。
+      emptyTurnSteered.set(sid, { count: used + 1, lastAt: now05 });
+      emptyTurnLifetime.set(sid, life05 + 1);
       steerHint(ag, cfg.emptyTurnHint, name).then((via) => {
-        emptyTurnSteered.set(sid, { count: used + 1, lastAt: now05 });
-        emptyTurnLifetime.set(sid, life05 + 1);
         note(`EMPTY-TURN-STEER session=${sid} turn=${st.turn} via=${via}（第 ${used + 1}/${maxSteer} 次）`);
       }).catch((e) => {
         note(`EMPTY-TURN-STEER-FAIL session=${sid} ${String(e).slice(0, 160)}`);

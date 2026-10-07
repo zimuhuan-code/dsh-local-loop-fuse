@@ -17,7 +17,8 @@ DSH 原生插件：**输出 / 思考循环护栏**。三条线：
 ③ 同一会话窗口内**强信号**累计达 `strikesBeforeCancel` ⇒ 真切断。
 **① 线已上膛（`dryRun=false`，2026-09-29 维护者定）**。
 
-- 版本：**v0.8.2**（2026-10-07：**①b 线「低多样性高重复」** —— 修「带噪声的交替空转」**结构性漏报**）
+- 版本：**v0.8.3**（2026-10-07：在 v0.8.2 的 **①b 低多样性** + **①c 注入**之上补 6 条 ——
+  ①c 额度用尽可配置**真掐断** / ⑤线**会话终身硬顶** / TTL 起点随 DEFER 重置 / `frame.turn` 注释更正 + 测试防线）
   ⚠️ `0.8.0` **未发布**，⑤ 线随 `0.8.1` 一起发。
 - ⚠️ **本包 `index.js` 末尾有一个可选挂载点**（不属于本项目功能，**将来会移除**）——
   见下方「关于 `index.js` 末尾的可选挂载点」一节。
@@ -455,8 +456,9 @@ node test-islooping.mjs    # 28/28 · 纯函数：重复判定（含 ①b/①b-2
 node test-abort.mjs        # 12/12 · 集成：① 线"检测 ⇒ 真 cancel"（v0.3.3 新增，回归本次两层 bug）
 node test-cancel.mjs       # 14/14 · 集成：③ 线 strike ⇒ cancel（约 35 s）
 node test-dump.mjs         # 42/42 · v0.6.0 ④线：脱敏 / 取证切片 / 三条线落盘 / 去重 / 禁名单守卫 / 上限（约 8 s）
-node test-empty-turn.mjs   # 19/19 · v0.8.0 ⑤线：零正文判据 + 上膛路径（约 1 s）
-node test-p1b.mjs          # 25/25 · v0.8.2 ①c：注入 / 跨 attempt 观测 / DEFER / episode 上限 / FAIL 占额度 / 默认值钉住（约 4 s）
+node test-empty-turn.mjs   # 20/20 · v0.8.0 ⑤线：零正文判据 + 上膛路径；v0.8.3 加终身硬顶（约 1 s）
+node test-p1b.mjs          # 32/32 · v0.8.2 ①c：注入 / 跨 attempt 观测 / DEFER / episode 上限 / FAIL 占额度 / 默认值钉住；
+                           #        v0.8.3 加额度掐断 / 终身硬顶 / 真 turn 防线（约 4 s）
 ```
 
 ⚠️ **写集成测试时务必 `dumpSamples: false`**（或把 `dumpDir` 指到临时目录）——
@@ -482,9 +484,14 @@ node test-p1b.mjs          # 25/25 · v0.8.2 ①c：注入 / 跨 attempt 观测 
 
 ## 状态与后续
 
-- **v0.8.2（2026-10-07 · 待发布）**：①b 末窗支 + ①b-2 滑窗支（尾部补偿）+ ①c P1-b 注入与观测 +
-  能力自检 + **四个测试抓到的 bug + 两轮独立审阅推翻的八条设计/口径**（见上）。**测试 140 项全绿**
-  （islooping 28 · abort 12 · cancel 14 · dump 42 · empty-turn 19 · **p1b 25** · `samples/` 未污染）。
+- **v0.8.3（2026-10-07 · 待发布）**：在**已发布的 v0.8.2** 之上补 6 条 —— **①c 额度用尽可配置真掐断**
+  （`p1bQuotaAction:'cancel'`：跨 step 循环**每 step 只命中一次、永远攒不到 attempt 内阈值**，这是唯一出路）·
+  **⑤线会话终身硬顶**（`emptyTurnSteerMaxSessionHard`，默认 12）· **TTL 起点随 DEFER 重置** ·
+  `frame.turn` 注释更正 + **测试防线（真 turn / G）**。**测试 148 项全绿**
+  （islooping 28 · abort 12 · cancel 14 · dump 42 · empty-turn **20** · **p1b 32** · `samples/` 未污染）。
+- **v0.8.2（2026-10-07 · 已发布）**：①b 末窗支 + ①b-2 滑窗支（尾部补偿）+ ①c P1-b 注入与观测 +
+  能力自检 + **四个测试抓到的 bug + 两轮独立审阅推翻的八条设计/口径**（见上）。测试 140 项全绿
+  （islooping 28 · abort 12 · cancel 14 · dump 42 · empty-turn 19 · **p1b 25**）。
   ⚠️ **重启 dsh 后必核三行**：`STEER-RESOLVE …` → `P1B-CAPABILITY …` → 真命中时的 `P1B-INJECT … via=…`；
   其中**自建兜底（`via=self-built`）已被独立审阅端到端验证**（append → deriveMessages → durable 回放全通、
   与官方构造器逐字段等价 ⇒ 见 `07-experiments/2026-10-07-p1b-inject-round1.md` §1）。
