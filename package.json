@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-loop-fuse",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "DSH 循环护栏：① assistant-stream 字符重复检测（可 abort）；①b 低多样性高重复（末窗 + 滑窗两支，抓「带噪声的交替空转」与「正常推理里夹一段空转」——① 线的精确匹配结构上抓不到它们）；①c ① 线命中时注入「停止」类词 + 预注册观测（注入是温和动作，先于掐断）；② 行动层「无进展」停滞检测；②b 同参工具调用连击（按**动作参数**判定，忽略 description 之类自注）；③ 反复卡住达阈值 ⇒ agent.cancel() 真切断；⑤ 零正文 turn（只有思考、正文为空）检测。",
   "type": "module",
   "main": "index.js",
