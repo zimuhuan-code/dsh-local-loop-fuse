@@ -66,12 +66,16 @@ echo "【③ 效果层 —— 注入后观测（双读数 · **只看注入成�
 # ⚠️ 必须按 `injected=true` 过滤（拾遗第 3 轮 §2.2 实测）：早期实现里 SKIP/FAIL 也会产出 verdict
 #   ⇒ 有效率的分母被"根本没注入"的样本污染。现在代码侧已修（未注入不建观测），
 #   这里再过滤一次是**对历史日志的防御**。
-v_ok=$(c 'P1B-OBSERVE.*injected=true.*verdict=有效')
+# 🔴 §A：**分池**。`attributable=false` = 窗口被 DEFER 过 ⇒ 后面那个 turn 是「用户新发起的」，
+#   循环停没停无法区分（掐断 + 换话题也能造成同样结果）⇒ **不许与可归因样本同池计率**。
+v_ok=$(c 'P1B-OBSERVE.*verdict=有效.*attributable=true')
+v_okx=$(c 'P1B-OBSERVE.*verdict=有效.*attributable=false')
 v_no=$(c 'P1B-OBSERVE.*injected=true.*verdict=无效')
 v_un=$(c 'P1B-OBSERVE.*injected=true.*verdict=不确定')
 v_cut=$(c 'P1B-OBSERVE.*verdict=观察中断')
 v_tot=$((v_ok + v_no + v_un))
-line '有效（k24 降 & 注入后不再循环）' "$v_ok" "$v_tot"
+line '有效·可归因（turnsSpanned=0）' "$v_ok" "$v_tot"
+line '有效(跨turn·不可归因) 不计入率' "$v_okx" "$((v_tot + v_okx))"
 line '无效（注入后仍循环）' "$v_no" "$v_tot"
 line '不确定' "$v_un" "$v_tot"
 printf '   %-30s %s\n' '观察中断（turn 结束未满 N）' "$v_cut"

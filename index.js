@@ -188,7 +188,13 @@ export const DEFAULTS = {
   //   ⇒ 光靠 attempt 内的 `p1bDone` 挡不住跨 step 的循环：实测一个会话注入 **6 次**，且每条都
   //   **永久进 durable transcript**（`dsh-agent-loop:1028`）。姊妹插件 `loop-restart-exp` 的教训：
   //   「**steer 没有平台级限次保护**，无条件重启 = 自造死循环」。
-  p1bSteerMaxPerSession: 2,
+  // ⚠️ 键名与语义（第 3 轮审阅 §F）：这是**每个 episode**的上限。
+  //   旧名 `p1bSteerMaxPerSession` 已改名，仍兼容（apply 里有 alias + 一行日志）。
+  p1bSteerMaxPerEpisode: 2,
+  // 🔴 **会话终身硬顶**（§F 补的上界）：episode 计数是**滑动 idle-gap**、不是定长窗口 ——
+  //   一个每 ~11 min 循环一次的常驻会话会**永远算新 episode** ⇒ 只靠它等于没有上限
+  //   （实测量级 ≈260 条/天永久写进会话存档）。这一条是不可绕过的硬顶。
+  p1bSteerMaxPerSessionHard: 8,
   // ⚠️ 上面那个上限的**计数单位**（拾遗第 2 轮 §1-2）：按「循环 episode」而不是会话终身制。
   //   会话级终身计数下，一个常驻会话的样本天花板就是 2，而统计脚本自己规定「n<5 不足以下结论」
   //   ⇒ 重启后观察**在统计上不可能出结论**。现在：距上次注入超过本窗口 ⇒ 视为新 episode（计数归零）。
@@ -916,6 +922,10 @@ export const apply = (ctx, config) => {
    * @type {Map<string, {count:number, lastAt:number}>}
    */
   const p1bSteeredBySession = new Map();
+  /** 会话**终身**注入计数（§F 的硬顶依据） @type {Map<string, number>} */
+  const p1bSteerLifetime = new Map();
+  /** 观测窗口 TTL（§B）：挂太久的窗一律结算，避免「下一个 turn 是谁就算谁」 */
+  const p1bTtlMs = Math.max(1, cfg.p1bEpisodeWindowMinutes ?? 10) * 60000;
   /** 取/衰减 episode 计数（⑤ 线共用同一套语义，见 §Q3-2） */
   const episodeOf = (map, sid, now, ttlMinutes) => {
     const rec = map.get(sid);
@@ -942,15 +952,20 @@ export const apply = (ctx, config) => {
       const drop = comparable ? Math.round((1 - k24After / p.k24Before) * 100) : null;
       const ok = comparable && p.injected === true
         && k24After <= p.k24Before * (1 - cfg.p1bSuccessDropPct / 100) && still === false;
-      // `注入未确认` = 窗口建了但 steerHint 还没 resolve（§1-3a）⇒ **不进效果层分母**
-      const verdict = interrupted ? '观察中断'
-        : (p.injected !== true ? '注入未确认' : (ok ? '有效' : (still === true ? '无效' : '不确定')));
+      // 🔴 §A：**归因**。被 DEFER 过的窗口，其后面的 turn 是「用户新发起的 turn」（被掐断后不会自动
+      //   开新 turn）⇒ 循环停没停**无法区分**是注入的功劳还是"掐断 + 换话题"⇒ 不许与普通样本同池计率。
+      const attributable = (p.spans ?? 0) === 0;
+      const base = ok ? (attributable ? '有效' : '有效(跨turn·不可归因)')
+        : (still === true ? '无效' : '不确定');
+      // §D：`注入未确认` **优先于** `观察中断` —— 竞态里 steer 尚未 resolve，先别归到"中断"桶，
+      //   否则能力层（INJECT 成功）与效果层的计数会互相打脸、且 `injected=false` 与后一行 INJECT 矛盾。
+      const verdict = p.injected !== true ? '注入未确认' : (interrupted ? '观察中断' : base);
       const ctx = Object.entries(extra).filter(([, v]) => v != null).map(([k, v]) => `${k}=${v}`).join(' ');
       note(`P1B-OBSERVE session=${sid ?? '?'} attempt=${p.injectAttempt} N=${cfg.p1bObserveChars} `
          + `segLen=${p.acc.length} blindChars=${p.blindChars} k24Before=${p.k24Before} k24BeforeWin=${p.k24BeforeWin} `
          + `k24After=${k24After} k24AfterWin=${afterWin} drop=${drop == null ? '—' : drop + '%'} `
          + `line1StillHits=${still} injected=${p.injected} verdict=${verdict} `
-         + `turnsSpanned=${p.spans ?? 0}${ctx ? ' ' + ctx : ''} `
+         + `turnsSpanned=${p.spans ?? 0} attributable=${attributable}${ctx ? ' ' + ctx : ''} `
          + `—— ⚠️ 基础率 2/6 ⇒ 单次只作记录、不作结论`);
     } catch (e) {
       // ⚠️ 这里**不许静默**（§1-6）：本文件对注入侧的纪律是「SKIP/FAIL 必须留痕」，观测侧同理。
@@ -992,10 +1007,19 @@ export const apply = (ctx, config) => {
       const pend = sidOfFrame ? p1bPending.get(sidOfFrame) : null;
       if (pend && c.text) {
         const curTurn = lastTurnByAgent.get(agent) ?? frame.turn ?? null;
+        // §B：DEFER 过的窗**绑定它遇到的第一个新 turn**，之后照常走跨 turn 守卫 ——
+        //   原来 `deferred=true` 直接豁免了守卫 ⇒ 两个 turn 的文本混进同一读数（实测 segLen 2200 > N 2000）。
+        if (pend.deferred && pend.openTurn == null && curTurn != null) pend.openTurn = curTurn;
         // §1-3b：跨 turn ⇒ **先结算再累计**（否则两个 turn 的文本混进同一个窗，还会被下一次注入覆盖）
-        if (!pend.deferred && pend.openTurn != null && curTurn != null && curTurn !== pend.openTurn) {
+        if (pend.openTurn != null && curTurn != null && curTurn !== pend.openTurn) {
           p1bPending.delete(sidOfFrame);
           emitP1bObserve(pend, agent, sidOfFrame, true, { why: 'turn-changed' });
+        } else if (pend.openedAt && Date.now() - pend.openedAt > p1bTtlMs) {
+          // §B：TTL —— 挂太久的窗一律结算并留痕（`P1B-OBSERVE-EXPIRED` 便于统计）
+          p1bPending.delete(sidOfFrame);
+          note(`P1B-OBSERVE-EXPIRED session=${sidOfFrame} attempt=${pend.injectAttempt} `
+             + `ageMs=${Date.now() - pend.openedAt} ttlMin=${cfg.p1bEpisodeWindowMinutes}`);
+          emitP1bObserve(pend, agent, sidOfFrame, true, { why: 'ttl-expired' });
         } else {
           if (frame.attemptId === pend.injectAttempt) pend.blindChars += c.text.length;
           else pend.acc += c.text;
@@ -1011,7 +1035,8 @@ export const apply = (ctx, config) => {
       st.nextCheck = st.buf.length + cfg.checkEvery;
       if (isLooping(st.buf, cfg)) {
         st.hits += 1;
-        const turn = turnOfAttempt(frame.attemptId);
+        const turn = turnOfAttempt(frame.attemptId);          // ⚠️ 这是 **attempt 尾号**，不是 turn（§G）
+        const realTurn = lastTurnByAgent.get(agent) ?? null;   // ← 需要真 turn 的地方一律用它
         const sid = agent?.session?.id ?? agent?.session?.header?.id;
         // v0.3.3：直接取"最近一次请求"的 signal（不再按 frame.turn 索引 —— 那个字段根本不存在）
         const rec = signals.get(agent);
@@ -1029,20 +1054,31 @@ export const apply = (ctx, config) => {
         //     姊妹插件 `tools/loop-restart-exp` 的原话：「steer 没有平台级限次保护，无条件重启 = 自造死循环」。
         if (cfg.p1bEnabled !== false && !st.p1bDone && st.hits >= (cfg.p1bInjectAtHit ?? 1)) {
           st.p1bDone = true;
-          const steerMax = Math.max(1, cfg.p1bSteerMaxPerSession ?? 2);
+          // §F：**两道**上限 —— per-episode（统计要）**加上**会话终身硬顶（安全属性）。
+          //   旧键 `p1bSteerMaxPerSession` 仍兼容（作为 per-episode 值）。
+          // ⚠️ 兼容旧键要**比较 DEFAULTS**：新键在 DEFAULTS 里总有默认值 ⇒ `??` 永远取新键、旧键形同虚设。
+          //   判据 = 「用户显式写了旧键」且「新键仍是默认值」⇒ 用旧键。
+          const legacyMax = cfg.p1bSteerMaxPerSession;
+          const epMaxRaw = (legacyMax != null && cfg.p1bSteerMaxPerEpisode === DEFAULTS.p1bSteerMaxPerEpisode)
+            ? legacyMax : (cfg.p1bSteerMaxPerEpisode ?? 2);
+          const epMax = Math.max(1, epMaxRaw);
+          // ⚠️ 硬顶**独立**、绝不能被 epMax 抬高（`Math.max(epMax, hard)` 会让 hard<epMax 时失效 —— 实测踩到）。
+          const hardMax = Math.max(1, cfg.p1bSteerMaxPerSessionHard ?? 8);
           const now = Date.now();
           const ep = episodeOf(p1bSteeredBySession, sid, now, cfg.p1bEpisodeWindowMinutes);
+          const lifeUsed = sid ? (p1bSteerLifetime.get(sid) ?? 0) : 0;
           const hitAt = st.hits;
           const canSteer = Boolean(agent && typeof agent.steer === 'function');
-          if (sid && canSteer && ep.count >= steerMax) {
+          if (sid && canSteer && (ep.count >= epMax || lifeUsed >= hardMax)) {
             note(`P1B-INJECT-QUOTA session=${sid} turn=${lastTurnByAgent.get(agent) ?? '?'} `
-               + `attempt=${frame.attemptId} —— 本 episode 已注入 ${ep.count}/${steerMax} 次`
-               + `（窗口 ${cfg.p1bEpisodeWindowMinutes} min），跳过`);
+               + `attempt=${frame.attemptId} —— episode=${ep.count}/${epMax} lifetime=${lifeUsed}/${hardMax}`
+               + `（episode 窗口 ${cfg.p1bEpisodeWindowMinutes} min；lifetime 为**会话终身硬顶**），跳过`);
           } else {
             const win = Math.min(st.buf.length, cfg.p1bObserveChars);
             const p = {
               injectAttempt: frame.attemptId,
               openTurn: lastTurnByAgent.get(agent) ?? frame.turn ?? null,
+              openedAt: Date.now(),
               deferred: false,
               spans: 0,
               atChars: st.buf.length,
@@ -1062,6 +1098,7 @@ export const apply = (ctx, config) => {
               }
               p1bPending.set(sid, p);
               p1bSteeredBySession.set(sid, { count: ep.count + 1, lastAt: now });
+              p1bSteerLifetime.set(sid, lifeUsed + 1);   // §F：终身计数（预扣，与 episode 同时）
             }
             if (canSteer) {
               // ⚠️ 动态 import ⇒ 不能阻塞流式事件链；**成败都留痕**（本项替使用者发消息，不许静默）
@@ -1071,7 +1108,7 @@ export const apply = (ctx, config) => {
                    + `attempt=${frame.attemptId} hit=${hitAt} via=${via} `
                    + `atChars=${p.atChars} k24Before=${p.k24Before} k24BeforeWin=${p.k24BeforeWin} `
                    + `observeN=${cfg.p1bObserveChars} dropPct=${cfg.p1bSuccessDropPct} `
-                   + `quota=${ep.count + 1}/${steerMax} —— 预注册参数已打印；`
+                   + `quota=episode:${ep.count + 1}/${epMax} lifetime:${lifeUsed + 1}/${hardMax} —— 预注册参数已打印；`
                    + `⚠️ 基础率 2/6（本簇 6 段真循环有 2 段自愈）⇒ 单次结果只作记录、不作证据`);
               }).catch((e) => {
                 note(`P1B-INJECT-FAIL session=${sid ?? '?'} attempt=${frame.attemptId} ${String(e).slice(0, 160)}`
@@ -1098,7 +1135,7 @@ export const apply = (ctx, config) => {
         } else {
           // v0.4.0-B：文本线是**强信号** ⇒ 也计入 strike 池（③线跨 turn 累计用）
           const sid = agent?.session?.id ?? agent?.session?.header?.id;
-          const n = sid ? recordStrike(sid, 'text-loop', { turn }) : 0;
+          const n = sid ? recordStrike(sid, 'text-loop', { turn: realTurn }) : 0;
           // ── 路径 A（主）：`agent.cancel()` —— v0.3.3 的真正修法 ──────────────
           // 为什么不是 `sig.abort()`：实测 Node 22 里 `AbortSignal` 实例上**没有 abort 方法**
           //   （`typeof c.signal.abort === 'undefined'`），只有 `AbortController` 能 abort；
@@ -1116,7 +1153,7 @@ export const apply = (ctx, config) => {
               note(`ABORT-VIA-CANCEL session=${sid ?? '?'} attempt=${frame.attemptId} `
                  + `len=${st.buf.length} hits=${st.hits} keepInbox=${cfg.cancelKeepInbox} `
                  + `cause=hook ← 文本重复判定为循环，已中止该 turn`);
-              noteCancel(`CANCEL source=text-loop session=${sid ?? '?'} turn=${turn ?? '?'} `
+              noteCancel(`CANCEL source=text-loop session=${sid ?? '?'} turn=${realTurn ?? '?'} `
                  + `hits=${st.hits} len=${st.buf.length} strikes=${n}/${cfg.strikesBeforeCancel} `
                  + `keepInbox=${cfg.cancelKeepInbox} cause=hook`);
             } catch (e) {
@@ -1128,7 +1165,7 @@ export const apply = (ctx, config) => {
             try {
               sig.abort(new Error('loop-fuse: output loop detected'));
               st.canceled = true;
-              note(`ABORT-VIA-SIGNAL attempt=${frame.attemptId} turn=${turn ?? '?'} `
+              note(`ABORT-VIA-SIGNAL attempt=${frame.attemptId} turn=${realTurn ?? '?'} `
                  + `len=${st.buf.length} hits=${st.hits} sigTurn=${rec?.turn ?? '?'}`);
             } catch (e) {
               note(`ABORT-FAIL attempt=${frame.attemptId} ${String(e)}`);
@@ -1145,7 +1182,7 @@ export const apply = (ctx, config) => {
         {
           const ev = extractCycleEvidence(st.buf, cfg);
           dumpSample({
-            kind: 'text-loop', sid, turn, attemptId: frame.attemptId,
+            kind: 'text-loop', sid, turn: realTurn, attemptId: frame.attemptId,
             why: `isLooping hit #${st.hits}（window=${cfg.window} repeats=${cfg.repeats} history=${cfg.history}）`,
             acted: !cfg.dryRun && st.hits >= cfg.textStrikesBeforeCancel,
             evidence: {
@@ -1285,6 +1322,8 @@ export const apply = (ctx, config) => {
           if (pendEnd.acc.length === 0 && reasonKind === 'aborted' && (pendEnd.spans ?? 0) < 1) {
             pendEnd.spans = (pendEnd.spans ?? 0) + 1;
             pendEnd.deferred = true;
+            pendEnd.openTurn = null;   // 🔴 必须清空：绑定逻辑靠 `openTurn == null` 才有机会认领新 turn
+                                       //    （不回填的话，守卫会拿旧 turn 直接判 turn-changed 结算掉 —— 实测过）
             note(`P1B-OBSERVE-DEFER session=${sid} attempt=${pendEnd.injectAttempt} `
                + `turnEndReason=${reasonKind} turnsSpanned=${pendEnd.spans} —— 注入尚未被消费`
                + `（本 turn 被掐断且无新 attempt），窗口带进下一个 turn`);
@@ -1476,9 +1515,21 @@ export const apply = (ctx, config) => {
   // §1-8：①c/⑤ 的**行为参数必须有 load-time 特征串** —— 否则"日志里没有 P1B-* 行"时
   //   无法区分「没触发」与「跑的是旧代码」（本仓库自己立的规矩，见上面那段注释）。
   note(`loaded v${VERSION} p1bEnabled=${cfg.p1bEnabled} injectAtHit=${cfg.p1bInjectAtHit} `
-     + `observeN=${cfg.p1bObserveChars} steerMaxPerSession=${cfg.p1bSteerMaxPerSession} `
+     + `observeN=${cfg.p1bObserveChars} steerMaxPerEpisode=${cfg.p1bSteerMaxPerEpisode ?? cfg.p1bSteerMaxPerSession} `
+     + `steerMaxHard=${cfg.p1bSteerMaxPerSessionHard} `
      + `episodeWinMin=${cfg.p1bEpisodeWindowMinutes} dropPct=${cfg.p1bSuccessDropPct} `
      + `emptyTurnAction=${cfg.emptyTurnAction} emptyTurnSteerMax=${cfg.emptyTurnSteerMax}`);
+  // §F：旧键名兼容 + 一行 deprecation（只有用户显式写了旧键才会走到这里）
+  if (cfg.p1bSteerMaxPerSession != null && cfg.p1bSteerMaxPerEpisode == null) {
+    note(`loaded v${VERSION} ⚠️ 配置项 p1bSteerMaxPerSession 已改名为 p1bSteerMaxPerEpisode`
+       + `（旧名仍兼容，本次按旧值 ${cfg.p1bSteerMaxPerSession} 生效）`);
+  }
+  // §C：`minChars < p1bObserveChars` ⇒ `k24BeforeWin` 恒小于 `k24AfterWin` ⇒ `comparable=false`
+  //   ⇒ **`verdict=有效` 结构上不可达**（测试夹具就是 minChars:1000）。默认两者相等故不咬，但要说出来。
+  if (cfg.minChars < cfg.p1bObserveChars) {
+    note(`loaded v${VERSION} P1B-WARN minChars(${cfg.minChars}) < observeN(${cfg.p1bObserveChars}) `
+       + `⇒ k24BeforeWin 恒小于 k24AfterWin ⇒ verdict=有效 不可达（请把两者设为相等，或调大 minChars）`);
+  }
 
   // ─────────────────────────────────────────────────────────────────────
   // ⚠️ 可选挂载点（**维护者本机的实验代码，不属于本项目的功能**）

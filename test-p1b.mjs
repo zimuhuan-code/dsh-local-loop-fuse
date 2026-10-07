@@ -115,7 +115,7 @@ function hitOnce(ctx, agent, attemptId) {
     /P1B-INJECT session=s-inject .*attempt=a1 hit=1 via=(dsh-llm|self-built) /.test(log) && calls.steer.length === 1,
     log.match(/P1B-INJECT[^\n]*/)?.[0]?.slice(0, 110) ?? '(无日志)');
   t('④ 预注册参数已打印（observeN / dropPct / atChars / k24Before / quota）',
-    /observeN=2000 dropPct=50 quota=1\/2/.test(log) && /atChars=\d+ k24Before=\d+/.test(log));
+    /observeN=2000 dropPct=50 quota=episode:1\/2 lifetime:1\/8/.test(log) && /atChars=\d+ k24Before=\d+/.test(log));
   t('④b 注入文本 = p1bHint（含「停止推理」）',
     calls.steer.length === 1 && /停止推理/.test(JSON.stringify(calls.steer[0])));
 
@@ -156,7 +156,7 @@ function hitOnce(ctx, agent, attemptId) {
 
 // ── ⑩b 跨 attempt 有**每会话上限**（拾遗第 3 轮 §3：实测一会话 6 条、且永久进存档）──
 {
-  const ctx = mk({ p1bSteerMaxPerSession: 1 });
+  const ctx = mk({ p1bSteerMaxPerEpisode: 1 });
   const { agent, calls } = mkAgent('s-quota');
   hitOnce(ctx, agent, 'a1');                 // 第 1 次注入
   await sleep(300);
@@ -165,7 +165,7 @@ function hitOnce(ctx, agent, attemptId) {
   const log = readLog();
   t('⑩b 跨 attempt · 超过 p1bSteerMaxPerSession ⇒ P1B-INJECT-QUOTA，不再注入',
     count(log, /P1B-INJECT session=s-quota/g) === 1
-    && /P1B-INJECT-QUOTA session=s-quota .*已注入 1\/1 次/.test(log)
+    && /P1B-INJECT-QUOTA session=s-quota .*episode=1\/1 lifetime=1\/8/.test(log)
     && calls.steer.length === 1,
     `INJECT=${count(log, /P1B-INJECT session=s-quota/g)} QUOTA=${count(log, /P1B-INJECT-QUOTA/g)} steer=${calls.steer.length}`);
 }
@@ -269,7 +269,7 @@ function hitOnce(ctx, agent, attemptId) {
 {
   t('⑰ 发布包默认值：p1bEnabled=false · emptyTurnAction=log · probeMount=false',
     DEFAULTS.p1bEnabled === false && DEFAULTS.emptyTurnAction === 'log' && DEFAULTS.probeMount === false
-    && DEFAULTS.p1bSteerMaxPerSession >= 1,
+    && DEFAULTS.p1bSteerMaxPerEpisode >= 1 && DEFAULTS.p1bSteerMaxPerSessionHard >= DEFAULTS.p1bSteerMaxPerEpisode,
     `p1bEnabled=${DEFAULTS.p1bEnabled} emptyTurnAction=${DEFAULTS.emptyTurnAction} probeMount=${DEFAULTS.probeMount}`);
   t('⑰b 注入额度按 episode 计（有衰减窗口参数，不是会话终身制）',
     typeof DEFAULTS.p1bEpisodeWindowMinutes === 'number' && DEFAULTS.p1bEpisodeWindowMinutes > 0,
@@ -293,11 +293,13 @@ function hitOnce(ctx, agent, attemptId) {
   await sleep(300);
   t('⑱b 带进来的窗口在下一个 turn 出结论（turnsSpanned=1）',
     /P1B-OBSERVE session=s-defer .*turnsSpanned=1/.test(readLog()));
+  t('⑱c §A：DEFER 过的样本标 attributable=false 且 verdict 带「不可归因」',
+    /P1B-OBSERVE session=s-defer .*verdict=有效\(跨turn·不可归因\).*attributable=false/.test(readLog()));
 }
 
 // ── ⑲ FAIL 也占额度（§1-5：通路坏了就该停手，而不是每个 step 再试一次）──
 {
-  const ctx = mk({ p1bSteerMaxPerSession: 1 });
+  const ctx = mk({ p1bSteerMaxPerEpisode: 1 });
   const { agent, calls } = mkAgent('s-fail');
   // 记录调用**再**抛错 —— 这样 `calls.steer.length` 就是"尝试次数"，正是 §1-5 要看的量
   agent.steer = (...a) => { calls.steer.push(a); throw new Error('boom'); };
@@ -310,6 +312,39 @@ function hitOnce(ctx, agent, attemptId) {
     /P1B-INJECT-FAIL session=s-fail/.test(log) && /P1B-INJECT-QUOTA session=s-fail/.test(log)
     && calls.steer.length === 1,
     `FAIL=${count(log, /P1B-INJECT-FAIL session=s-fail/g)} QUOTA=${count(log, /P1B-INJECT-QUOTA session=s-fail/g)} steer=${calls.steer.length}`);
+}
+
+// ── ⑳ §F：会话**终身硬顶**（episode 计数是滑动窗口，挡不住"每 11 分钟循环一次"的常驻会话）──
+{
+  const ctx = mk({ p1bSteerMaxPerEpisode: 99, p1bSteerMaxPerSessionHard: 1 });
+  const { agent, calls } = mkAgent('s-hard');
+  hitOnce(ctx, agent, 'a1');                 // 第 1 次注入（lifetime 1/1）
+  await sleep(300);
+  feed(ctx, agent, 'b1', A.repeat(8));       // 新 attempt 再命中 ⇒ 撞**终身硬顶**
+  await sleep(400);
+  const log = readLog();
+  t('⑳ 会话终身硬顶：episode 还有额度也用完 ⇒ QUOTA（lifetime=1/1）',
+    /P1B-INJECT-QUOTA session=s-hard .*lifetime=1\/1/.test(log) && calls.steer.length === 1,
+    log.match(/P1B-INJECT-QUOTA[^\n]*/)?.[0]?.slice(0, 110) ?? '(无日志)');
+}
+
+// ── ㉑ §D：竞态（steer 未 resolve）⇒ 记「注入未确认」，不再混进「观察中断」桶 ──
+{
+  const ctx = mk();
+  const { agent } = mkAgent('s-race');
+  hitOnce(ctx, agent, 'a1');
+  turnEnd(ctx, 's-race', 1, 'completed');    // **不 sleep** ⇒ 抢在 steerHint().then 之前收口
+  await sleep(400);
+  t('㉑ §D 竞态 ⇒ verdict=注入未确认（标签不再错落在「观察中断」）',
+    /P1B-OBSERVE session=s-race .*verdict=注入未确认/.test(readLog()),
+    readLog().match(/P1B-OBSERVE session=s-race[^\n]*/)?.[0]?.slice(0, 120) ?? '(无日志)');
+}
+
+// ── ㉒ §C：minChars < observeN ⇒ 必须 warn（否则「有效」结构上不可达而无人知）──
+{
+  const log = readLog();
+  t('㉒ §C minChars<observeN 会打 P1B-WARN（测试夹具就是 1000<2000）',
+    /P1B-WARN minChars\(1000\) < observeN\(2000\)/.test(log));
 }
 
 const bad = results.filter((r) => !r.ok);
